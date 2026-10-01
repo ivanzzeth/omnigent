@@ -1207,18 +1207,11 @@ def test_format_pane_debug_tail_keeps_composer_overflow_row() -> None:
     assert tail.endswith("Gemini 3.1 Pro · low")
 
 
-def test_format_pane_debug_tail_fallback_skips_blank_padding() -> None:
-    """Without composer rules, blank padding never shrinks the diagnostic tail."""
-    content = [f"status line {index}" for index in range(1, 16)]
-    pane = "\n".join(f"{line}\n" for line in content)
-    tail = _mod._format_pane_debug_tail(pane)
-    assert tail == "\n".join(content)
-
-
-def test_format_pane_debug_tail_caps_fallback_at_max() -> None:
-    """A separator-less pane keeps only the last ``_PANE_TAIL_MAX_LINES`` non-blank lines."""
+def test_format_pane_debug_tail_caps_fallback_and_skips_blank_padding() -> None:
+    """A separator-less pane drops blank padding and keeps only the last 20 nonblank lines."""
     content = [f"status line {index}" for index in range(1, 26)]
-    tail = _mod._format_pane_debug_tail("\n".join(content))
+    padded = "\n".join(f"{line}\n" for line in content)
+    tail = _mod._format_pane_debug_tail(padded)
     assert tail.splitlines() == content[-_mod._PANE_TAIL_MAX_LINES :]
 
 
