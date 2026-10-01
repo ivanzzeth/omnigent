@@ -28,6 +28,7 @@ _PYTHONPATH_DIRS = (_REPO_ROOT, _REPO_ROOT / "sdks" / "ui", _REPO_ROOT / "sdks" 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 _ISSUE_PROMPT = r"file a GitHub issue with this report\? \[Y/n\]"
 _INTERPRETER_BLAMED = re.compile(r"(?i)python installation|python interpreter|standard library")
+_SHIM_NAME = "broken-stdlib"
 
 _SITECUSTOMIZE = """\
 import sys
@@ -45,7 +46,7 @@ sys.meta_path.insert(0, _MissingAiohttp())
 
 
 def _broken_stdlib_shim(tmp_path: Path) -> Path:
-    shim = tmp_path / "broken-stdlib"
+    shim = tmp_path / _SHIM_NAME
     stdlib_asyncio = Path(sysconfig.get_paths()["stdlib"]) / "asyncio"
     shutil.copytree(stdlib_asyncio, shim / "asyncio", ignore=shutil.ignore_patterns("__pycache__"))
     runners = shim / "asyncio" / "runners.py"
@@ -104,7 +105,14 @@ def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | None, str]:
         child.sendline("n")
     child.close()
     if "Started the host daemon" in output:
-        subprocess.run([script, "stop"], env=env, capture_output=True, timeout=90, check=False)
+        # The shim that broke asyncio for the launch must not also break the cleanup.
+        pythonpath = env["PYTHONPATH"].split(os.pathsep)
+        clean_env = dict(
+            env, PYTHONPATH=os.pathsep.join(p for p in pythonpath if not p.endswith(_SHIM_NAME))
+        )
+        subprocess.run(
+            [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
+        )
     return child.exitstatus, _ANSI_RE.sub("", output)
 
 
@@ -112,8 +120,9 @@ def test_launch_blames_the_broken_python_stdlib_not_omnigent(tmp_path: Path) -> 
     env = _fresh_cli_env(tmp_path, _broken_stdlib_shim(tmp_path))
     status, output = _run_bare_omnigent(env)
 
-    assert status != 0, (
-        f"omnigent started despite the interpreter's asyncio being broken:\n{output}"
+    assert status == 1, (
+        f"omnigent did not exit with status 1 (got {status!r}) although the interpreter's "
+        f"asyncio is broken:\n{output}"
     )
     assert "No module named 'aiohttp'" in output, (
         f"the emulated stdlib fault did not fire; cannot judge the launch output:\n{output}"

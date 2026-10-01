@@ -245,7 +245,7 @@ def handle_crash(
     _HANDLING.on = True
     try:
         stream = real_stderr()
-        broken = broken_stdlib_module(exc)
+        broken = broken_stdlib_module(exc, tb)
         if broken is not None:
             # A damaged interpreter is not an Omnigent crash: no report, no issue prompt.
             render_broken_stdlib_notice(exc, broken, stream)

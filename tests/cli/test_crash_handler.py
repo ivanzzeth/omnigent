@@ -17,13 +17,14 @@ import io
 import os
 import re
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
 
 from omnigent import crash_handler as ch
 from omnigent import crash_ui
-from omnigent._interpreter_health import exit_if_stdlib_broken
+from omnigent._interpreter_health import broken_stdlib_module, exit_if_stdlib_broken
 from omnigent.version import VERSION
 
 
@@ -452,10 +453,13 @@ def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Broken Python installation (a standard-library module fails to import)
 # --------------------------------------------------------------------------- #
-def _fail_in_module_body(name: str, filename: Path, code: str) -> BaseException:
+def _fail_in_module_body(
+    name: str, filename: Path, code: str, *, materialize: bool = True
+) -> BaseException:
     """Run ``code`` as the body of module ``name`` loaded from ``filename``; return the error."""
-    filename.parent.mkdir(parents=True, exist_ok=True)
-    filename.write_text(code, encoding="utf-8")
+    if materialize:
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        filename.write_text(code, encoding="utf-8")
     try:
         exec(compile(code, str(filename), "exec"), {"__name__": name})
     except Exception as e:
@@ -492,10 +496,31 @@ def test_stdlib_import_failure_is_explained_not_reported(
     assert "asyncio.runners" in out
     assert "runners.py" in out and "import aiohttp_is_not_installed" in out
     assert "No module named 'aiohttp_is_not_installed'" in out
+    assert "PYTHONPATH" in out  # the copy under tmp_path shadows the interpreter's own
     assert "ran into an issue" not in out
     assert "file a GitHub issue" not in out
     assert opened == []
     assert not list((data_dir / "crashes").glob("crash-*.md"))
+
+
+def test_failure_inside_the_installed_stdlib_advises_reinstalling_python(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module under the interpreter's own stdlib directory means the installation is damaged."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    runners = Path(sysconfig.get_paths()["stdlib"]) / "asyncio" / "runners.py"
+    exc = _fail_in_module_body(
+        "asyncio.runners", runners, "import aiohttp_is_not_installed\n", materialize=False
+    )
+
+    ch.handle_crash(exc, interactive=False, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "Python installation" in out
+    assert "Repair or reinstall Python" in out
+    assert "PYTHONPATH" not in out
 
 
 def test_missing_module_in_own_code_is_still_reported(
@@ -520,6 +545,52 @@ def test_missing_module_in_own_code_is_still_reported(
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
+
+
+def test_crash_through_entry_script_module_frame_is_still_reported(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real uncaught crash passes through the ``__main__`` module frame; that is not stdlib."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    exc = _fail_in_module_body(
+        "__main__",
+        tmp_path / "bin" / "omnigent",
+        "def main():\n    raise ValueError('boom')\n\n\nmain()\n",
+    )
+    assert broken_stdlib_module(exc) is None
+
+    ch.handle_crash(exc, interactive=True, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def test_stdlib_failure_passed_as_explicit_traceback_is_explained(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The threading hook passes ``handle_crash`` the traceback separately; detect from it."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    exc = _fail_in_module_body(
+        "asyncio.runners", tmp_path / "asyncio" / "runners.py", "import aiohttp_is_not_installed\n"
+    )
+    tb = exc.__traceback__
+    exc.with_traceback(None)
+
+    ch.handle_crash(exc, tb=tb, interactive=False, source="thread:worker")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "Python installation" in out
+    assert "asyncio.runners" in out
+    assert "A crash report was saved to" not in out
 
 
 def test_cli_import_guard_exits_only_for_stdlib_failures(
