@@ -456,7 +456,7 @@ def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 def _fail_in_module_body(
     name: str, filename: Path, code: str, *, materialize: bool = True
-) -> BaseException:
+) -> Exception:
     """Run ``code`` as the body of module ``name`` loaded from ``filename``; return the error."""
     if materialize:
         filename.parent.mkdir(parents=True, exist_ok=True)

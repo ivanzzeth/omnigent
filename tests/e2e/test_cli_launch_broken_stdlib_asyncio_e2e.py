@@ -50,10 +50,15 @@ def _broken_stdlib_shim(tmp_path: Path) -> Path:
     lines = runners.read_text(encoding="utf-8").splitlines(keepends=True)
     # Before the module's first real import, wherever this Python version puts it.
     first_import = next(
-        i
-        for i, line in enumerate(lines)
-        if line.startswith(("import ", "from ")) and not line.startswith("from __future__")
+        (
+            i
+            for i, line in enumerate(lines)
+            if line.startswith(("import ", "from ")) and not line.startswith("from __future__")
+        ),
+        None,
     )
+    if first_import is None:
+        pytest.fail(f"no top-level import line found in {runners}; the shim needs updating")
     lines.insert(first_import, "import aiohttp\n")
     runners.write_text("".join(lines), encoding="utf-8")
     (shim / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
@@ -101,7 +106,11 @@ def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | str, str]:
     output = ""
     try:
         while True:
-            index = child.expect([_ISSUE_PROMPT, pexpect.EOF], timeout=120)
+            try:
+                index = child.expect([_ISSUE_PROMPT, pexpect.EOF], timeout=120)
+            except pexpect.TIMEOUT:
+                output += child.before or ""  # keep what was seen so the cleanup check sees it too
+                raise
             output += child.before or ""
             if index == 1:
                 break
@@ -138,6 +147,9 @@ def test_launch_blames_the_broken_python_stdlib_not_omnigent(tmp_path: Path) -> 
     assert not re.search(_ISSUE_PROMPT, output), (
         "a broken Python installation was presented as an omnigent crash to report "
         f"(this is how the ticket was auto-filed):\n{output}"
+    )
+    assert not list((tmp_path / "data" / "crashes").glob("crash-*.md")), (
+        "a crash report was written for a failure that is not an omnigent crash"
     )
     assert _INTERPRETER_BLAMED.search(output), (
         "the launch failure does not tell the user their Python installation / standard "

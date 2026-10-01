@@ -11,6 +11,7 @@ except Exception as _asyncio_import_error:
         from omnigent._interpreter_health import exit_if_stdlib_broken
 
         exit_if_stdlib_broken(_asyncio_import_error)
+        del exit_if_stdlib_broken
     except SystemExit:
         raise
     except Exception:  # noqa: BLE001
