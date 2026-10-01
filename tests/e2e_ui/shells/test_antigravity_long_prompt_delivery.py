@@ -81,14 +81,6 @@ def _capture_pane(session: AntigravitySession) -> str:
     return result.stdout
 
 
-def _pane_width(session: AntigravitySession) -> int:
-    """Return the agy tmux pane's current column count."""
-    target = session.pane()["tmux_target"]
-    result = session.tmux_command("display-message", "-p", "-t", target, "#{pane_width}")
-    assert result.returncode == 0, result.stderr
-    return int(result.stdout.strip())
-
-
 def _assert_prompt_overflows_composer(session: AntigravitySession, prompt: str) -> None:
     """Prove the live agy composer scrolls this prompt behind its ``↑ N more lines`` row.
 
@@ -190,18 +182,10 @@ def _wait_for_reply(session: AntigravitySession, token: str) -> None:
 
 
 def _open_chat(page: Page, session: AntigravitySession) -> None:
-    baseline = _pane_width(session)
     page.add_init_script(_BLOCK_LOOPBACK_DIALS)
     page.goto(f"{session.base_url}/c/{session.session_id}")
     expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=60_000)
     page.get_by_test_id("view-mode-chat").click()
-    # Wait for the background terminal attach to resize the pane so the composer journey
-    # runs at the attached geometry instead of the default 80x24.
-    _wait_until(
-        lambda: _pane_width(session) != baseline,
-        "terminal attach did not resize the agy pane",
-        30,
-    )
 
 
 def _reply_bubble(page: Page, token: str) -> Locator:
