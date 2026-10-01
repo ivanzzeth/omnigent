@@ -13,6 +13,7 @@ developer's real ``~/.omnigent``.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import os
 import re
@@ -545,6 +546,74 @@ def test_missing_module_in_own_code_is_still_reported(
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
+
+
+def _import_tty_without_termios() -> BaseException:
+    """Import CPython's own ``tty.py`` with ``termios`` unavailable, as on Windows."""
+
+    class _NoTermios:
+        def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+            if fullname == "termios":
+                raise ModuleNotFoundError("No module named 'termios'", name="termios")
+
+    spec = importlib.util.spec_from_file_location(
+        "tty", Path(sysconfig.get_paths()["stdlib"]) / "tty.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    finder = _NoTermios()
+    sys.meta_path.insert(0, finder)
+    saved = sys.modules.pop("termios", None)
+    try:
+        spec.loader.exec_module(module)
+    except ModuleNotFoundError as e:
+        return e
+    finally:
+        sys.meta_path.remove(finder)
+        if saved is not None:
+            sys.modules["termios"] = saved
+    raise AssertionError("tty imported although termios was unavailable")
+
+
+def test_stdlib_wrapper_missing_a_platform_module_is_still_reported(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tty`` without ``termios`` is a platform gap in the caller, not a damaged Python."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    exc = _import_tty_without_termios()
+    assert exc.__traceback__ is not None
+    assert broken_stdlib_module(exc) is None
+
+    ch.handle_crash(exc, interactive=True, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def test_shadow_installed_in_site_packages_is_not_the_stdlib(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A venv's ``lib/pythonX.Y/site-packages`` is not the interpreter's standard library."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    shadow = Path(sysconfig.get_paths()["platstdlib"]) / "site-packages" / "asyncio" / "runners.py"
+    exc = _fail_in_module_body(
+        "asyncio.runners", shadow, "import aiohttp_is_not_installed\n", materialize=False
+    )
+
+    ch.handle_crash(exc, interactive=False, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "PYTHONPATH" in out
+    assert "Repair or reinstall Python" not in out
 
 
 def test_crash_through_entry_script_module_frame_is_still_reported(

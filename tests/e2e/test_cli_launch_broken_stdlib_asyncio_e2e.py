@@ -1,11 +1,8 @@
-"""Bare ``omnigent`` on an interpreter whose stdlib ``asyncio`` cannot be imported.
+"""Bare ``omnigent`` must diagnose an unimportable stdlib instead of crash-reporting it.
 
-A user's CPython 3.12 had ``asyncio/runners.py`` line 11 reading ``import aiohttp`` with
-aiohttp not installed, so ``import asyncio`` itself failed and launching ``omnigent``
-surfaced that as an omnigent crash with a prompt to file a GitHub issue. The broken
-interpreter is emulated for the spawned CLI only: a shadow copy of the stdlib ``asyncio``
-package with that line inserted, plus a ``sitecustomize`` finder that keeps ``aiohttp``
-unimportable in venvs that have it.
+The spawned CLI sees a shadow copy of the stdlib ``asyncio`` package whose ``runners.py``
+imports ``aiohttp`` while a ``sitecustomize`` finder keeps ``aiohttp`` unimportable, so the
+test interpreter itself is untouched.
 """
 
 from __future__ import annotations
@@ -51,7 +48,13 @@ def _broken_stdlib_shim(tmp_path: Path) -> Path:
     shutil.copytree(stdlib_asyncio, shim / "asyncio", ignore=shutil.ignore_patterns("__pycache__"))
     runners = shim / "asyncio" / "runners.py"
     lines = runners.read_text(encoding="utf-8").splitlines(keepends=True)
-    lines.insert(10, "import aiohttp\n")
+    # Before the module's first real import, wherever this Python version puts it.
+    first_import = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith(("import ", "from ")) and not line.startswith("from __future__")
+    )
+    lines.insert(first_import, "import aiohttp\n")
     runners.write_text("".join(lines), encoding="utf-8")
     (shim / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
     return shim
@@ -96,23 +99,26 @@ def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | None, str]:
         timeout=120,
     )
     output = ""
-    while True:
-        index = child.expect([_ISSUE_PROMPT, pexpect.EOF], timeout=120)
-        output += child.before or ""
-        if index == 1:
-            break
-        output += child.after
-        child.sendline("n")
-    child.close()
-    if "Started the host daemon" in output:
-        # The shim that broke asyncio for the launch must not also break the cleanup.
-        pythonpath = env["PYTHONPATH"].split(os.pathsep)
-        clean_env = dict(
-            env, PYTHONPATH=os.pathsep.join(p for p in pythonpath if not p.endswith(_SHIM_NAME))
-        )
-        subprocess.run(
-            [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
-        )
+    try:
+        while True:
+            index = child.expect([_ISSUE_PROMPT, pexpect.EOF], timeout=120)
+            output += child.before or ""
+            if index == 1:
+                break
+            output += child.after
+            child.sendline("n")
+    finally:
+        child.close()
+        if "Started the host daemon" in output:
+            # The shim that broke asyncio for the launch must not also break the cleanup.
+            pythonpath = env["PYTHONPATH"].split(os.pathsep)
+            clean_env = dict(
+                env,
+                PYTHONPATH=os.pathsep.join(p for p in pythonpath if not p.endswith(_SHIM_NAME)),
+            )
+            subprocess.run(
+                [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
+            )
     return child.exitstatus, _ANSI_RE.sub("", output)
 
 
