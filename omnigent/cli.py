@@ -23,6 +23,16 @@ from importlib import import_module, resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
+# ``import asyncio`` is where a damaged interpreter first fails in the imports below,
+# before main() installs the crash handler; name the broken Python, not a dependency.
+try:
+    import asyncio  # noqa: F401
+except Exception as _asyncio_import_error:
+    from omnigent._interpreter_health import exit_if_stdlib_broken
+
+    exit_if_stdlib_broken(_asyncio_import_error)
+    raise
+
 import click
 import psutil
 import yaml
