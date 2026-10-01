@@ -1084,10 +1084,9 @@ _AGY_ACTIVE_MARKER = "esc to cancel"
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
-# agy keeps a draft taller than its composer viewport scrolled to the bottom and
-# shows the hidden head as an ``> ↑ N more lines`` overflow row. The row proves the
-# paste rendered even though the submit needle (the draft's first line) scrolled out
-# of view, so it is treated as draft-present evidence (measured on agy 1.2.4).
+# A draft taller than agy's composer viewport scrolls to the bottom and shows its
+# hidden head as an "↑ N more lines" overflow row; the row proves the paste rendered
+# even though the submit needle (the draft's first line) scrolled out (agy 1.2.4).
 _AGY_SCROLL_OVERFLOW_RE = re.compile(r"↑\s*\d+\s+more lines?\b")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
@@ -1424,8 +1423,7 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
     if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
         return True
-    # A draft taller than the viewport scrolls so its first line (the needle) hides
-    # behind an "↑ N more lines" overflow row; that row proves the paste rendered.
+    # The overflow row only appears when a draft is present, so it counts as rendered.
     if any(_AGY_SCROLL_OVERFLOW_RE.search(line) for line in candidates):
         return True
     normalized_needle = needle.strip() if needle else ""

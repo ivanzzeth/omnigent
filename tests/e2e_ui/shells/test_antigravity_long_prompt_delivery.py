@@ -1,17 +1,13 @@
 """Long prompts reach a real agy TUI even when agy scrolls the draft in its composer.
 
-A draft taller than agy's input box shows only its tail and hides the start behind
-an ``↑ N more lines`` row, so the bridge never sees the prompt's first line before
-it presses Enter. Runs the server, runner, tmux and the real Antigravity CLI against
-a local mock Gemini backend (no credentials)::
+A draft taller than agy's input box shows only its tail and hides the start behind an
+``↑ N more lines`` row, so the bridge never sees the prompt's first line before pressing
+Enter. These runs drive the server, runner, tmux and the real Antigravity CLI against a
+local mock Gemini backend (no credentials); set ``OMNIGENT_E2E_ANTIGRAVITY=mock``.
 
-    OMNIGENT_E2E_ANTIGRAVITY=mock .venv/bin/python -m pytest \\
-        tests/e2e_ui/shells/test_antigravity_long_prompt_delivery.py -v --ui-skip-build
-
-The ``posted`` journey delivers through ``POST /v1/sessions/{id}/events`` with no
-browser attached (the sub-agent dispatch shape), so the runner-created pane keeps
-its default 80x24 size; the ``composer`` journey sends from the web chat composer,
-whose terminal attach narrows the pane and wraps the draft even further.
+The ``posted`` journey delivers with no browser attached, so the pane keeps its default
+80x24 size; the ``composer`` journey sends from the web chat composer, whose terminal
+attach narrows the pane and wraps the draft even further.
 """
 
 from __future__ import annotations
@@ -48,15 +44,14 @@ _REPLY_TIMEOUT_S = 90.0
 
 
 def _long_single_paragraph_prompt(token: str) -> str:
-    """A single ~950-char paragraph that agy renders verbatim and scrolls behind its overflow row.
+    """A single ~950-char paragraph agy renders verbatim and scrolls behind its overflow row.
 
-    The length is deliberate. A shorter paragraph fits the 80x24 composer's viewport and is
-    delivered either way; a much longer paste (past ~1,000 chars) is collapsed to a
-    ``[Pasted text #N]`` placeholder the gate already recognises. In between, agy wraps the draft
-    past the viewport and hides its first line behind an ``↑ N more lines`` row — the shape that
-    strands the prompt before this fix. The paragraph's opening is unique so the gate's first-line
-    needle genuinely disappears once that line scrolls off; the token stays at the very end,
-    visible in the composer tail, so a delivered turn is detectable from the mock's reply.
+    The length is deliberate: a shorter paragraph fits the 80x24 composer and delivers either
+    way, and a much longer paste (past ~1,000 chars) collapses to a ``[Pasted text #N]``
+    placeholder the gate already recognises. In between, agy hides the draft's first line behind
+    an ``↑ N more lines`` row — the shape that strands the prompt before this fix. The opening is
+    unique so the first-line needle really disappears; the token stays at the end so a delivered
+    turn shows up in the mock's reply.
     """
     return (
         "Please review the repository notes for the next release and write a short "
