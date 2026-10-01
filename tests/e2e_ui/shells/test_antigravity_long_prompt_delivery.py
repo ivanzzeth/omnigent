@@ -20,7 +20,11 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from omnigent.harnesses.antigravity_native.bridge import _agy_input_region, read_tmux_info
+from omnigent.harnesses.antigravity_native.bridge import (
+    _AGY_SCROLL_OVERFLOW_RE,
+    _agy_input_region,
+    read_tmux_info,
+)
 from tests.e2e_ui.shells.test_antigravity_tmux_recovery import (  # noqa: F401 — fixtures reused
     AntigravitySession,
     _wait_until,
@@ -74,6 +78,30 @@ def _capture_pane(session: AntigravitySession) -> str:
     result = session.tmux_command("capture-pane", "-p", "-t", session.pane()["tmux_target"])
     assert result.returncode == 0, result.stderr
     return result.stdout
+
+
+def _assert_prompt_overflows_composer(session: AntigravitySession, prompt: str) -> None:
+    """Prove the live agy composer scrolls this prompt behind its ``↑ N more lines`` row.
+
+    Pastes the prompt into the real composer without submitting, so a geometry or CLI
+    change that let the paragraph fit without overflowing fails here instead of quietly
+    routing delivery around the behaviour this suite guards.
+    """
+    target = session.pane()["tmux_target"]
+    buffer_name = "e2e-overflow-probe"
+    assert session.tmux_command("set-buffer", "-b", buffer_name, "--", prompt).returncode == 0
+    paste = session.tmux_command("paste-buffer", "-p", "-d", "-b", buffer_name, "-t", target)
+    assert paste.returncode == 0, paste.stderr
+
+    def _overflow_rendered() -> bool:
+        region = _agy_input_region(_capture_pane(session))
+        return _AGY_SCROLL_OVERFLOW_RE.search(region) is not None
+
+    _wait_until(
+        _overflow_rendered,
+        "agy did not scroll the long prompt behind an overflow row at this geometry",
+        30,
+    )
 
 
 def _composer_is_empty(session: AntigravitySession) -> bool:
@@ -186,6 +214,7 @@ def test_posted_long_single_paragraph_prompt_is_delivered(
     )
     response.raise_for_status()
     _wait_for_reply(session, token)
+    _assert_prompt_overflows_composer(session, prompt)
 
     _open_chat(page, session)
     expect(_reply_bubble(page, token)).to_have_count(1, timeout=60_000)
@@ -201,8 +230,10 @@ def test_composer_long_single_paragraph_prompt_is_delivered(
     _wait_for_agy_idle(session)
     _open_chat(page, session)
     token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
-    page.get_by_placeholder("Send a message…").fill(_long_single_paragraph_prompt(token))
+    prompt = _long_single_paragraph_prompt(token)
+    page.get_by_placeholder("Send a message…").fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
     _wait_for_reply(session, token)
+    _assert_prompt_overflows_composer(session, prompt)
     expect(_reply_bubble(page, token)).to_have_count(1, timeout=60_000)
     _show_terminal(page)

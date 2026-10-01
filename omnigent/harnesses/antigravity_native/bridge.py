@@ -1349,6 +1349,11 @@ def _redact_pane_secrets(text: str) -> str:
     return redacted
 
 
+# Cap diagnostic pane tails so a deep separator or long transcript cannot surface
+# a large region into the redacted delivery-failure error.
+_PANE_TAIL_MAX_LINES = 20
+
+
 def _format_pane_debug_tail(pane: str) -> str:
     """
     Return a short, redacted pane tail for delivery failure diagnostics.
@@ -1364,8 +1369,12 @@ def _format_pane_debug_tail(pane: str) -> str:
     """
     lines = pane.splitlines()
     separators = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
-    start = separators[-2] if len(separators) >= 2 else len(lines) - 12
-    tail_lines = [line.rstrip() for line in lines[max(0, start) :] if line.strip()]
+    if len(separators) >= 2:
+        # Keep the composer head so its overflow row survives the cap.
+        tail_lines = [line.rstrip() for line in lines[separators[-2] :] if line.strip()]
+        tail_lines = tail_lines[:_PANE_TAIL_MAX_LINES]
+    else:
+        tail_lines = [line.rstrip() for line in lines if line.strip()][-_PANE_TAIL_MAX_LINES:]
     return _redact_pane_secrets("\n".join(tail_lines)) or "<empty pane>"
 
 

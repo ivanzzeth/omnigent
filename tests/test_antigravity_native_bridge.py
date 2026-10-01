@@ -1207,6 +1207,14 @@ def test_format_pane_debug_tail_keeps_composer_overflow_row() -> None:
     assert tail.endswith("Gemini 3.1 Pro · low")
 
 
+def test_format_pane_debug_tail_fallback_skips_blank_padding() -> None:
+    """Without composer rules, blank padding never shrinks the diagnostic tail."""
+    content = [f"status line {index}" for index in range(1, 16)]
+    pane = "\n".join(f"{line}\n" for line in content)
+    tail = _mod._format_pane_debug_tail(pane)
+    assert tail == "\n".join(content)
+
+
 # ---------------------------------------------------------------------------
 # Account-verification re-delivery
 # ---------------------------------------------------------------------------
