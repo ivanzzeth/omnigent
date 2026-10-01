@@ -7,9 +7,14 @@ from __future__ import annotations
 try:
     import asyncio  # noqa: F401
 except Exception as _asyncio_import_error:
-    from omnigent._interpreter_health import exit_if_stdlib_broken
+    try:
+        from omnigent._interpreter_health import exit_if_stdlib_broken
 
-    exit_if_stdlib_broken(_asyncio_import_error)
+        exit_if_stdlib_broken(_asyncio_import_error)
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001
+        pass  # the diagnosis is best-effort; the original error is re-raised below
     raise
 
 import concurrent.futures

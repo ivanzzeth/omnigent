@@ -86,7 +86,7 @@ def _fresh_cli_env(tmp_path: Path, shim: Path) -> dict[str, str]:
     return env
 
 
-def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | None, str]:
+def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | str, str]:
     script = str(omnigent_console_script())
     child = pexpect.spawn(
         script,
@@ -119,7 +119,9 @@ def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | None, str]:
             subprocess.run(
                 [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
             )
-    return child.exitstatus, _ANSI_RE.sub("", output)
+    # A signal death reports no exit status; name the signal so the failure is diagnosable.
+    status = child.exitstatus if child.exitstatus is not None else f"signal {child.signalstatus}"
+    return status, _ANSI_RE.sub("", output)
 
 
 def test_launch_blames_the_broken_python_stdlib_not_omnigent(tmp_path: Path) -> None:

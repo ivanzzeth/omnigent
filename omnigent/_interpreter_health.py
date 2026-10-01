@@ -33,14 +33,16 @@ def broken_stdlib_module(
 ) -> BrokenStdlibModule | None:
     """Return the stdlib module that failed to import, or ``None`` for an ordinary crash.
 
-    Only the innermost module body on the traceback (``tb``, else ``exc.__traceback__``)
-    decides: a stdlib module raising while it is imported means a damaged interpreter;
-    Omnigent or a dependency importing a module this platform lacks is still a bug there.
-    A stdlib module that merely failed to import another stdlib module (``tty`` without
-    ``termios``, ``curses`` without ``_curses``) is a platform gap, not damage, and is
-    left to the normal crash flow as well.
+    The innermost module body on the traceback (``tb``, else ``exc.__traceback__``) must be
+    a stdlib module; Omnigent or a dependency importing a module this platform lacks is
+    still a bug there. Then: an ``ImportError`` naming another stdlib module (``tty``
+    without ``termios``) is a platform gap, not damage; one naming a non-stdlib module is
+    damage whoever raised it, because a healthy stdlib never imports such a module; any
+    other error is damage only when every deeper frame is stdlib code, so a failing
+    third-party import hook stays a reportable crash.
     """
     innermost: BrokenStdlibModule | None = None
+    deeper: TracebackType | None = None
     tb = tb if tb is not None else exc.__traceback__
     while tb is not None:
         frame = tb.tb_frame
@@ -50,9 +52,16 @@ def broken_stdlib_module(
             # The entry script's own body runs as ``__main__``; it is never stdlib.
             if isinstance(name, str) and name != "__main__" and _is_stdlib_name(name):
                 innermost = BrokenStdlibModule(name, frame.f_code.co_filename, tb.tb_lineno)
+                deeper = tb.tb_next
         tb = tb.tb_next
-    if innermost is not None and isinstance(exc, ImportError) and _is_stdlib_name(exc.name):
+    if innermost is None:
         return None
+    if isinstance(exc, ImportError) and exc.name:
+        return None if _is_stdlib_name(exc.name) else innermost
+    while deeper is not None:
+        if not _is_stdlib_name(deeper.tb_frame.f_globals.get("__name__")):
+            return None
+        deeper = deeper.tb_next
     return innermost
 
 
@@ -63,8 +72,8 @@ def _inside_stdlib(filename: str) -> bool:
     real = os.path.normcase(os.path.realpath(filename))
     if {"site-packages", "dist-packages"} & set(real.split(os.sep)):
         return False
-    # Inside a venv ``platstdlib`` is the venv's own lib dir; ask for the base interpreter's.
-    paths = sysconfig.get_paths(vars={"base": sys.base_prefix, "platbase": sys.base_exec_prefix})
+    # Inside a venv only ``platstdlib`` points at the venv; redirect it to the base interpreter.
+    paths = sysconfig.get_paths(vars={"platbase": sys.base_exec_prefix})
     return any(
         real.startswith(os.path.normcase(os.path.realpath(paths[key])) + os.sep)
         for key in ("stdlib", "platstdlib")
@@ -102,7 +111,7 @@ def render_broken_stdlib_notice(
             "omnigent again.",
         ]
     else:
-        stdlib_dir = sysconfig.get_paths(vars={"base": sys.base_prefix})["stdlib"]
+        stdlib_dir = sysconfig.get_paths()["stdlib"]
         lines += [
             f"That file is outside this Python installation's standard library ({stdlib_dir}),",
             "so something on PYTHONPATH or in the working directory shadows the real module.",

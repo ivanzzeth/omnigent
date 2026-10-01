@@ -548,13 +548,13 @@ def test_missing_module_in_own_code_is_still_reported(
     assert "Python installation" not in out
 
 
-def _import_tty_without_termios() -> BaseException:
-    """Import CPython's own ``tty.py`` with ``termios`` unavailable, as on Windows."""
+def _import_tty_with_termios_failing(error: BaseException) -> BaseException:
+    """Import CPython's own ``tty.py`` while a meta-path finder fails ``import termios``."""
 
     class _NoTermios:
         def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
             if fullname == "termios":
-                raise ModuleNotFoundError("No module named 'termios'", name="termios")
+                raise error
 
     spec = importlib.util.spec_from_file_location(
         "tty", Path(sysconfig.get_paths()["stdlib"]) / "tty.py"
@@ -566,7 +566,7 @@ def _import_tty_without_termios() -> BaseException:
     saved = sys.modules.pop("termios", None)
     try:
         spec.loader.exec_module(module)
-    except ModuleNotFoundError as e:
+    except Exception as e:
         return e
     finally:
         sys.meta_path.remove(finder)
@@ -585,7 +585,9 @@ def test_stdlib_wrapper_missing_a_platform_module_is_still_reported(
     stream = FakeTTY()
     monkeypatch.setattr(ch, "real_stderr", lambda: stream)
     monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
-    exc = _import_tty_without_termios()
+    exc = _import_tty_with_termios_failing(
+        ModuleNotFoundError("No module named 'termios'", name="termios")
+    )
     assert exc.__traceback__ is not None
     assert broken_stdlib_module(exc) is None
 
@@ -595,6 +597,64 @@ def test_stdlib_wrapper_missing_a_platform_module_is_still_reported(
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
+
+
+def test_dependency_import_hook_failure_inside_stdlib_import_is_reported(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A third-party finder blowing up while the stdlib imports is that finder's bug."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
+    stream = FakeTTY()
+    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    exc = _import_tty_with_termios_failing(RuntimeError("external dependency finder failed"))
+    assert isinstance(exc, RuntimeError)
+    assert broken_stdlib_module(exc) is None
+
+    ch.handle_crash(exc, interactive=True, source="test")
+
+    out = _strip_ansi(stream.getvalue())
+    assert "ran into an issue" in out
+    assert "Report saved here:" in out
+    assert "Python installation" not in out
+
+
+def test_foreign_import_in_stdlib_body_is_damage_even_when_a_finder_raises_it(
+    tmp_path: Path,
+) -> None:
+    """A stdlib body importing a non-stdlib module is damage no matter which finder failed."""
+
+    class _Missing:
+        def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+            if fullname == "aiohttp_is_not_installed":
+                raise ModuleNotFoundError(
+                    "No module named 'aiohttp_is_not_installed'", name="aiohttp_is_not_installed"
+                )
+
+    finder = _Missing()
+    sys.meta_path.insert(0, finder)
+    try:
+        exc = _fail_in_module_body(
+            "asyncio.runners",
+            tmp_path / "asyncio" / "runners.py",
+            "import aiohttp_is_not_installed\n",
+        )
+    finally:
+        sys.meta_path.remove(finder)
+    frames = [tb.tb_frame.f_code.co_name for tb in _walk(exc.__traceback__)]
+    assert frames[-1] == "find_spec"  # the finder's frame is innermost, as in the e2e shim
+    module = broken_stdlib_module(exc)
+    assert module is not None and module.name == "asyncio.runners"
+
+
+def _walk(tb: object) -> list:
+    out: list = []
+    while tb is not None:
+        out.append(tb)
+        tb = tb.tb_next  # type: ignore[attr-defined]
+    return out
 
 
 def test_shadow_installed_in_site_packages_is_not_the_stdlib(
@@ -665,7 +725,8 @@ def test_stdlib_failure_passed_as_explicit_traceback_is_explained(
 def test_cli_import_guard_exits_only_for_stdlib_failures(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The CLI's import-time guard re-raises ordinary errors and exits 1 for a broken stdlib."""
+    """The CLI's import-time guard returns on ordinary errors (the caller re-raises) and exits 1
+    for a broken stdlib."""
     assert exit_if_stdlib_broken(_make_exc("ordinary")) is None
     assert capsys.readouterr().err == ""
 
