@@ -14,8 +14,14 @@ except Exception as _asyncio_import_error:
         del exit_if_stdlib_broken
     except SystemExit:
         raise
-    except Exception:  # noqa: BLE001
-        pass  # the diagnosis is best-effort; the original error is re-raised below
+    except Exception as _diagnosis_error:  # noqa: BLE001
+        # The diagnosis is best-effort; leave a breadcrumb and re-raise the original error.
+        try:
+            import sys as _sys
+
+            _sys.stderr.write(f"(stdlib health check failed: {_diagnosis_error!r})\n")
+        except Exception:  # noqa: BLE001
+            pass
     raise
 
 import concurrent.futures

@@ -524,25 +524,30 @@ def test_failure_inside_the_installed_stdlib_advises_reinstalling_python(
     assert "PYTHONPATH" not in out
 
 
-def test_missing_module_in_own_code_is_still_reported(
-    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Omnigent importing a module this platform lacks is our bug and keeps the crash flow."""
+def _run_crash_flow(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> str:
+    """Run the interactive crash flow for ``exc`` (browser stubbed); return the screen text."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     monkeypatch.setattr(ch, "_open_browser", lambda url: True)
     monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
     stream = FakeTTY()
     monkeypatch.setattr(ch, "real_stderr", lambda: stream)
     monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    ch.handle_crash(exc, interactive=True, source="test")
+    return _strip_ansi(stream.getvalue())
+
+
+def test_missing_module_in_own_code_is_still_reported(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omnigent importing a module this platform lacks is our bug and keeps the crash flow."""
     exc = _fail_in_module_body(
         "omnigent.cli_native",
         tmp_path / "omnigent" / "cli_native.py",
         'raise ModuleNotFoundError("No module named \'termios\'", name="termios")\n',
     )
 
-    ch.handle_crash(exc, interactive=True, source="test")
+    out = _run_crash_flow(monkeypatch, exc)
 
-    out = _strip_ansi(stream.getvalue())
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
@@ -579,43 +584,37 @@ def test_stdlib_wrapper_missing_a_platform_module_is_still_reported(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``tty`` without ``termios`` is a platform gap in the caller, not a damaged Python."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
-    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
-    stream = FakeTTY()
-    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
     exc = _import_tty_with_termios_failing(
         ModuleNotFoundError("No module named 'termios'", name="termios")
     )
     assert exc.__traceback__ is not None
     assert broken_stdlib_module(exc) is None
 
-    ch.handle_crash(exc, interactive=True, source="test")
+    out = _run_crash_flow(monkeypatch, exc)
 
-    out = _strip_ansi(stream.getvalue())
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("external dependency finder failed"),
+        ModuleNotFoundError("No module named 'finder_dependency'", name="finder_dependency"),
+    ],
+    ids=["runtime-error", "finder-own-dependency-missing"],
+)
 def test_dependency_import_hook_failure_inside_stdlib_import_is_reported(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    """A third-party finder blowing up while the stdlib imports is that finder's bug."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
-    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
-    stream = FakeTTY()
-    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
-    exc = _import_tty_with_termios_failing(RuntimeError("external dependency finder failed"))
-    assert isinstance(exc, RuntimeError)
+    """A third-party finder failing while the stdlib imports ``termios`` is that finder's bug."""
+    exc = _import_tty_with_termios_failing(error)
+    assert exc is error
     assert broken_stdlib_module(exc) is None
 
-    ch.handle_crash(exc, interactive=True, source="test")
+    out = _run_crash_flow(monkeypatch, exc)
 
-    out = _strip_ansi(stream.getvalue())
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out
@@ -657,6 +656,20 @@ def _walk(tb: object) -> list:
     return out
 
 
+def test_error_raised_through_stdlib_frames_only_is_damage(tmp_path: Path) -> None:
+    """A stdlib body failing inside other stdlib code, with no foreign frame, is damage."""
+    exc = _fail_in_module_body(
+        "asyncio.runners", tmp_path / "asyncio" / "runners.py", "import json\njson.loads('{')\n"
+    )
+    assert not isinstance(exc, ImportError)
+    deeper = [tb.tb_frame.f_globals["__name__"] for tb in _walk(exc.__traceback__)][2:]
+    assert deeper and all(name.partition(".")[0] == "json" for name in deeper)
+
+    module = broken_stdlib_module(exc)
+
+    assert module is not None and module.name == "asyncio.runners"
+
+
 def test_shadow_installed_in_site_packages_is_not_the_stdlib(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -680,12 +693,6 @@ def test_crash_through_entry_script_module_frame_is_still_reported(
     data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A real uncaught crash passes through the ``__main__`` module frame; that is not stdlib."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(ch, "_open_browser", lambda url: True)
-    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: True)
-    stream = FakeTTY()
-    monkeypatch.setattr(ch, "real_stderr", lambda: stream)
-    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
     exc = _fail_in_module_body(
         "__main__",
         tmp_path / "bin" / "omnigent",
@@ -693,9 +700,8 @@ def test_crash_through_entry_script_module_frame_is_still_reported(
     )
     assert broken_stdlib_module(exc) is None
 
-    ch.handle_crash(exc, interactive=True, source="test")
+    out = _run_crash_flow(monkeypatch, exc)
 
-    out = _strip_ansi(stream.getvalue())
     assert "ran into an issue" in out
     assert "Report saved here:" in out
     assert "Python installation" not in out

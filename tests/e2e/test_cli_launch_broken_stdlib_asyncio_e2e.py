@@ -7,6 +7,7 @@ test interpreter itself is untouched.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -125,9 +126,11 @@ def _run_bare_omnigent(env: dict[str, str]) -> tuple[int | str, str]:
                 env,
                 PYTHONPATH=os.pathsep.join(p for p in pythonpath if not p.endswith(_SHIM_NAME)),
             )
-            subprocess.run(
-                [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
-            )
+            # Cleanup is best-effort and must not mask the primary failure.
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                subprocess.run(
+                    [script, "stop"], env=clean_env, capture_output=True, timeout=90, check=False
+                )
     # A signal death reports no exit status; name the signal so the failure is diagnosable.
     status = child.exitstatus if child.exitstatus is not None else f"signal {child.signalstatus}"
     return status, _ANSI_RE.sub("", output)

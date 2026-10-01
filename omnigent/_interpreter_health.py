@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import linecache
 import os
+import re
 import sys
 import sysconfig
 import traceback
 from types import TracebackType
 from typing import NamedTuple, TextIO
+
+_IMPORT_LINE = re.compile(
+    r"^\s*(?:from\s+([\w.]+)\s+import\b|import\s+([\w.]+(?:\s*,\s*[\w.]+)*))"
+)
 
 
 class BrokenStdlibModule(NamedTuple):
@@ -28,6 +33,15 @@ def _is_stdlib_name(name: object) -> bool:
     return isinstance(name, str) and name.partition(".")[0] in sys.stdlib_module_names
 
 
+def _line_imports(filename: str, lineno: int, top: str) -> bool:
+    """Whether the import statement at ``filename:lineno`` requests a module in package ``top``."""
+    match = _IMPORT_LINE.match(linecache.getline(filename, lineno))
+    if match is None:
+        return False
+    names = [match.group(1)] if match.group(1) else match.group(2).split(",")
+    return any(name.strip().partition(".")[0] == top for name in names)
+
+
 def broken_stdlib_module(
     exc: BaseException, tb: TracebackType | None = None
 ) -> BrokenStdlibModule | None:
@@ -36,10 +50,11 @@ def broken_stdlib_module(
     The innermost module body on the traceback (``tb``, else ``exc.__traceback__``) must be
     a stdlib module; Omnigent or a dependency importing a module this platform lacks is
     still a bug there. Then: an ``ImportError`` naming another stdlib module (``tty``
-    without ``termios``) is a platform gap, not damage; one naming a non-stdlib module is
-    damage whoever raised it, because a healthy stdlib never imports such a module; any
-    other error is damage only when every deeper frame is stdlib code, so a failing
-    third-party import hook stays a reportable crash.
+    without ``termios``) is a platform gap, not damage; one naming a non-stdlib module that
+    the stdlib line itself imports is damage whoever raised it, because a healthy stdlib
+    never imports such a module; anything else is damage only when every deeper frame is
+    stdlib code, so a third-party import hook failing on its own dependency stays a
+    reportable crash.
     """
     innermost: BrokenStdlibModule | None = None
     deeper: TracebackType | None = None
@@ -57,7 +72,11 @@ def broken_stdlib_module(
     if innermost is None:
         return None
     if isinstance(exc, ImportError) and exc.name:
-        return None if _is_stdlib_name(exc.name) else innermost
+        top = exc.name.partition(".")[0]
+        if top in sys.stdlib_module_names:
+            return None
+        if _line_imports(innermost.filename, innermost.lineno, top):
+            return innermost
     while deeper is not None:
         if not _is_stdlib_name(deeper.tb_frame.f_globals.get("__name__")):
             return None
