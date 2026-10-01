@@ -131,8 +131,13 @@ def _wait_for_agy_idle(session: AntigravitySession) -> None:
 
 
 def _session_items(session: AntigravitySession) -> list[dict]:
-    response = httpx.get(f"{session.base_url}/v1/sessions/{session.session_id}/items", timeout=10)
-    response.raise_for_status()
+    try:
+        response = httpx.get(
+            f"{session.base_url}/v1/sessions/{session.session_id}/items", timeout=10
+        )
+        response.raise_for_status()
+    except httpx.TransportError:
+        return []  # transient blip; the polling caller retries
     return response.json()["data"]
 
 
@@ -195,6 +200,8 @@ def _reply_bubble(page: Page, token: str) -> Locator:
 
 
 def _show_terminal(page: Page) -> None:
+    # Reveal the agy TUI and hold it on screen so the demo recording captures the
+    # delivered prompt in the terminal, after chat-side delivery is already verified.
     page.get_by_test_id("view-mode-terminal").click()
     terminal = page.get_by_test_id("main-terminal-view").get_by_test_id("terminal-view")
     expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
