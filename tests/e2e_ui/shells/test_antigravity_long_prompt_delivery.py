@@ -5,9 +5,10 @@ A draft taller than agy's input box shows only its tail and hides the start behi
 Enter. These runs drive the server, runner, tmux and the real Antigravity CLI against a
 local mock Gemini backend (no credentials); set ``OMNIGENT_E2E_ANTIGRAVITY=mock``.
 
-The ``posted`` journey delivers with no browser attached, so the pane keeps its default
-80x24 size; the ``composer`` journey sends from the web chat composer, whose terminal
-attach narrows the pane and wraps the draft even further.
+Both journeys pin the agy pane to 80x24 before delivery so the paragraph wraps past the
+composer's height regardless of any attached terminal: the ``posted`` journey delivers with
+no browser attached, and the ``composer`` journey sends from the web chat composer whose
+terminal attach would otherwise widen the pane and let the draft fit.
 """
 
 from __future__ import annotations
@@ -79,6 +80,19 @@ def _capture_pane(session: AntigravitySession) -> str:
     result = session.tmux_command("capture-pane", "-p", "-t", session.pane()["tmux_target"])
     assert result.returncode == 0, result.stderr
     return result.stdout
+
+
+def _pin_pane_geometry(session: AntigravitySession, cols: int = 80, rows: int = 24) -> None:
+    """Pin the agy pane to a fixed size so the paragraph wraps past the composer's height.
+
+    An attached browser terminal would otherwise widen the pane and let the draft fit; a
+    manual window size holds the pane steady and ignores client resizes.
+    """
+    target = session.pane()["tmux_target"]
+    manual = session.tmux_command("set-window-option", "-t", target, "window-size", "manual")
+    assert manual.returncode == 0, manual.stderr
+    resized = session.tmux_command("resize-window", "-t", target, "-x", str(cols), "-y", str(rows))
+    assert resized.returncode == 0, resized.stderr
 
 
 def _assert_prompt_overflows_composer(session: AntigravitySession, prompt: str) -> None:
@@ -215,6 +229,7 @@ def test_posted_long_single_paragraph_prompt_is_delivered(
     """A ~950-char paragraph posted with no client attached (80x24 pane) is delivered."""
     session = antigravity_session
     _wait_for_agy_idle(session)
+    _pin_pane_geometry(session)
     token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
     prompt = _long_single_paragraph_prompt(token)
     response = httpx.post(
@@ -242,6 +257,7 @@ def test_composer_long_single_paragraph_prompt_is_delivered(
     session = antigravity_session
     _wait_for_agy_idle(session)
     _open_chat(page, session)
+    _pin_pane_geometry(session)
     token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
     prompt = _long_single_paragraph_prompt(token)
     page.get_by_placeholder("Send a message…").fill(prompt)
