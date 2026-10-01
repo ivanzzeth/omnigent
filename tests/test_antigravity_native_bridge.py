@@ -1215,6 +1215,25 @@ def test_format_pane_debug_tail_fallback_skips_blank_padding() -> None:
     assert tail == "\n".join(content)
 
 
+def test_format_pane_debug_tail_caps_fallback_at_max() -> None:
+    """A separator-less pane keeps only the last ``_PANE_TAIL_MAX_LINES`` non-blank lines."""
+    content = [f"status line {index}" for index in range(1, 26)]
+    tail = _mod._format_pane_debug_tail("\n".join(content))
+    assert tail.splitlines() == content[-_mod._PANE_TAIL_MAX_LINES :]
+
+
+def test_format_pane_debug_tail_caps_composer_region_from_the_head() -> None:
+    """A tall composer region is capped from its head so the overflow row survives."""
+    body = [f"draft line {index}" for index in range(1, 31)]
+    pane = "\n".join([_AGY_RULE, "> ↑ 3 more lines", *body, _AGY_RULE, "? for shortcuts"])
+    tail = _mod._format_pane_debug_tail(pane)
+    lines = tail.splitlines()
+    assert len(lines) == _mod._PANE_TAIL_MAX_LINES
+    assert lines[0] == _AGY_RULE
+    assert "↑ 3 more lines" in lines[1]
+    assert "? for shortcuts" not in tail
+
+
 # ---------------------------------------------------------------------------
 # Account-verification re-delivery
 # ---------------------------------------------------------------------------

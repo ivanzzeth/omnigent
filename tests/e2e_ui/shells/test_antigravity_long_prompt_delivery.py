@@ -23,6 +23,7 @@ from playwright.sync_api import Locator, Page, expect
 from omnigent.harnesses.antigravity_native.bridge import (
     _AGY_SCROLL_OVERFLOW_RE,
     _agy_input_region,
+    _format_pane_debug_tail,
     read_tmux_info,
 )
 from tests.e2e_ui.shells.test_antigravity_tmux_recovery import (  # noqa: F401 — fixtures reused
@@ -53,9 +54,9 @@ def _long_single_paragraph_prompt(token: str) -> str:
     The length is deliberate: a shorter paragraph fits the 80x24 composer and delivers either
     way, and a much longer paste (past ~1,000 chars) collapses to a ``[Pasted text #N]``
     placeholder the gate already recognises. In between, agy hides the draft's first line behind
-    an ``↑ N more lines`` row — the shape that strands the prompt before this fix. The opening is
-    unique so the first-line needle really disappears; the token stays at the end so a delivered
-    turn shows up in the mock's reply.
+    an ``↑ N more lines`` row — the shape that scrolls the draft's first line out of view.
+    The opening is unique so the first-line needle really disappears; the token stays at the
+    end so a delivered turn shows up in the mock's reply.
     """
     return (
         "Please review the repository notes for the next release and write a short "
@@ -102,11 +103,18 @@ def _assert_prompt_overflows_composer(session: AntigravitySession, prompt: str) 
         "agy did not scroll the long prompt behind an overflow row at this geometry",
         30,
     )
+    # Clear the probe draft so the delivered-journey assertions see a clean composer.
+    assert session.tmux_command("send-keys", "-t", target, "C-u").returncode == 0
+    _wait_until(
+        lambda: _composer_is_empty(session),
+        "overflow probe draft was not cleared",
+        10,
+    )
 
 
 def _composer_is_empty(session: AntigravitySession) -> bool:
-    region = _agy_input_region(_capture_pane(session))
-    return all(line.strip() in {"", ">"} for line in region.splitlines())
+    lines = _agy_input_region(_capture_pane(session)).splitlines()
+    return bool(lines) and all(line.strip() in {"", ">"} for line in lines)
 
 
 def _wait_for_agy_idle(session: AntigravitySession) -> None:
@@ -158,13 +166,13 @@ def _wait_for_reply(session: AntigravitySession, token: str) -> None:
         error = _delivery_error(items)
         assert not error, (
             f"the turn was not submitted: {error}\n--- agy composer ---\n"
-            f"{_agy_input_region(_capture_pane(session))}"
+            f"{_format_pane_debug_tail(_capture_pane(session))}"
         )
         time.sleep(1.0)
     else:
         raise AssertionError(
             f"no assistant reply within {_REPLY_TIMEOUT_S:.0f}s; "
-            f"agy pane:\n{_capture_pane(session)}"
+            f"agy pane:\n{_format_pane_debug_tail(_capture_pane(session))}"
         )
     _wait_until(
         lambda: _composer_is_empty(session),
