@@ -2979,6 +2979,7 @@ function createBrowserRegistryForWindow(win) {
         /* window torn down */
       }
     },
+    isHostFocused: () => !win.isDestroyed() && win.isFocused(),
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -2993,6 +2994,9 @@ function createBrowserRegistryForWindow(win) {
     showContextMenu: (items) => {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
+  });
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
   });
   return registry;
 }
@@ -3339,10 +3343,11 @@ function registerIpc() {
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
-      onLogin: () => log("Finish signing in in your browser, then come back here."),
+      onLogin: () => log("If a browser window opens, finish signing in there."),
     });
     if (!auth.ok) return { ok: false, error: auth.error };
-    log("Connecting this laptop to the server…");
+    // Close out the sign-in lines so the log never ends on a stale prompt.
+    log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
     if (result.ok) {
