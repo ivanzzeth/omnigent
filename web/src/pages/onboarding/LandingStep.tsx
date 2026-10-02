@@ -2,7 +2,7 @@
 // locally" / "Join your team". With presets: one "Join your team (<name>)" split
 // button; its dropdown lists other presets, recents, and a server URL field.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +14,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { normalizeServerUrl } from "@/pages/onboarding/ServerSelectStep";
+import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
+import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 /** Team name for a preset server URL: the host's first label, capitalized
  *  ("https://team.example.com/x" → "Team"). */
@@ -32,6 +34,8 @@ export function LandingStep({
   managedServerNames,
   recentServers,
   error,
+  connection = null,
+  onCancelConnect,
   onGetStarted,
   onJoinServer,
   onJoinManaged,
@@ -44,6 +48,9 @@ export function LandingStep({
   recentServers: string[];
   /** Connect error to show above the CTA (MDM landing only). */
   error?: string;
+  /** Progress of an in-flight join (MDM landing only; null when idle). */
+  connection?: ConnectProgress | null;
+  onCancelConnect?: () => void;
   onGetStarted: () => void;
   onJoinServer: () => void;
   /** Join a preset server (the split button + its dropdown). */
@@ -51,6 +58,16 @@ export function LandingStep({
   /** Join a recent or typed server URL (preset dropdown). */
   onJoinUrl: (url: string) => void;
 }) {
+  // Close the dropdown once a join starts: its field and items would otherwise
+  // stay usable (a second join) and cover the progress under the button.
+  const [menuOpen, setMenuOpen] = useState(false);
+  // The menu spans the whole split button, not just its chevron trigger.
+  const ctaRef = useRef<HTMLDivElement>(null);
+  const [menuWidth, setMenuWidth] = useState<number>();
+  const connecting = connection !== null;
+  useEffect(() => {
+    if (connecting) setMenuOpen(false);
+  }, [connecting]);
   const hasPresets = managedServers.length > 0;
   const [typedUrl, setTypedUrl] = useState("");
   const [invalid, setInvalid] = useState(false);
@@ -83,9 +100,10 @@ export function LandingStep({
 
       {hasPresets ? (
         // Only CTA: join the first preset, or pick another / type a URL.
-        <div className="flex gap-0">
+        <div ref={ctaRef} className="flex gap-0">
           <Button
             onClick={() => onJoinManaged(managedServers[0])}
+            loading={connecting}
             className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
           >
             <Users className="size-4" />
@@ -97,16 +115,23 @@ export function LandingStep({
               )
             </span>
           </Button>
-          <DropdownMenu>
+          <DropdownMenu
+            open={menuOpen}
+            onOpenChange={(open) => {
+              if (open) setMenuWidth(ctaRef.current?.offsetWidth);
+              setMenuOpen(open);
+            }}
+          >
             <DropdownMenuTrigger asChild>
               <Button
                 className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
                 aria-label="Choose team URL"
+                disabled={connecting}
               >
                 <ChevronDown className="size-4" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-80">
+            <DropdownMenuContent align="end" style={{ width: menuWidth }}>
               {otherServers.map((url) => (
                 <DropdownMenuItem
                   key={url}
@@ -114,7 +139,9 @@ export function LandingStep({
                     managedServers.includes(url) ? onJoinManaged(url) : onJoinUrl(url)
                   }
                 >
-                  {nameOf(url) ?? displayUrl(url)}
+                  <span className="truncate" title={url}>
+                    {nameOf(url) ?? displayUrl(url)}
+                  </span>
                 </DropdownMenuItem>
               ))}
               {otherServers.length > 0 && <DropdownMenuSeparator />}
@@ -163,6 +190,8 @@ export function LandingStep({
           </Button>
         </>
       )}
+
+      <ConnectStatus connection={connection} onCancel={onCancelConnect} />
     </div>
   );
 }

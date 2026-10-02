@@ -32,11 +32,13 @@ const {
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
+const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
@@ -64,6 +66,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
+const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
@@ -247,41 +250,29 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
-/**
- * Development builds always expose debugging. Packaged macOS builds require
- * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
- */
+const isDevBuild = !app.isPackaged || omnigentBuild === "dev";
+const getUserDefault =
+  !app.isPackaged && process.platform === "darwin"
+    ? getDevUserDefault
+    : systemPreferences.getUserDefault?.bind(systemPreferences);
+
+/** Packaged builds require an explicit user default to enable debugging. */
 function developerModeEnabled() {
   return isDeveloperModeEnabled({
     isPackaged: app.isPackaged,
     platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
+    getUserDefault,
   });
 }
 
 /** Read the current macOS MDM-provided server list without persisting it. */
 function managedServerUrls() {
-  return getManagedServerUrls({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getManagedServerUrls({ platform: process.platform, getUserDefault });
 }
 
 /** Display names for the MDM-provided servers, keyed by server URL. */
 function managedServerNames() {
-  return getManagedServerNames({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getManagedServerNames({ platform: process.platform, getUserDefault });
 }
 
 /**
@@ -289,13 +280,7 @@ function managedServerNames() {
  * macOS on every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
-  return getDatabricksInternalFeaturesEnabled({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
 
 /**
@@ -764,6 +749,7 @@ function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
   if (!attempt) return;
   connectionAttempts.delete(win);
+  connectionLoading.hide(win, attempt);
   attempt.pending = false;
   attempt.controller.abort(Object.assign(new Error(message), { name: "AbortError" }));
 }
@@ -1177,6 +1163,7 @@ const updater = createDesktopUpdater({
   // this to !app.isPackaged — not an env var — ensures a packaged app can
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
+  updatesEnabled: !app.isPackaged || !isDevBuild,
 });
 
 // Shell-owned About window: available from the native application menu even
@@ -1199,6 +1186,8 @@ const aboutWindow = createAboutWindow({
   aboutPage: ABOUT_PAGE,
   preloadPath: path.join(__dirname, "about_preload.js"),
 });
+
+const connectionLoading = createConnectionLoading({ BrowserWindow });
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -1662,6 +1651,9 @@ async function loadServerUrl(
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
+      if (!isSetupPageUrl(win.webContents.getURL())) {
+        connectionLoading.show(win, attempt, "Signing in…");
+      }
       try {
         const entered = new URL(serverUrl);
         const resolvedOrigin = await ensureDatabricksSession(
@@ -1704,12 +1696,14 @@ async function loadServerUrl(
     void fetchServerManifest(serverUrl).then((manifest) => {
       if (current()) setWindowServerManifest(win, manifest);
     });
+    connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
   } finally {
+    connectionLoading.hide(win, attempt);
     attempt.pending = false;
   }
 }
@@ -2985,6 +2979,7 @@ function createBrowserRegistryForWindow(win) {
         /* window torn down */
       }
     },
+    isHostFocused: () => !win.isDestroyed() && win.isFocused(),
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -2999,6 +2994,9 @@ function createBrowserRegistryForWindow(win) {
     showContextMenu: (items) => {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
+  });
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
   });
   return registry;
 }
@@ -3344,8 +3342,12 @@ function registerIpc() {
     if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
-    const auth = await serverManager.ensureServerAuth(cliCommand, target);
+    const auth = await serverManager.ensureServerAuth(cliCommand, target, {
+      onLogin: () => log("If a browser window opens, finish signing in there."),
+    });
     if (!auth.ok) return { ok: false, error: auth.error };
+    // Close out the sign-in lines so the log never ends on a stale prompt.
+    log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
     if (result.ok) {
@@ -3596,14 +3598,19 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-cli-status is only available to the setup page");
     }
+    // Concurrent: the setup page holds its first paint on this.
+    const [status, localUrl] = await Promise.all([
+      omnigentCli.getCliStatus(loadSettings().omnigent_path),
+      omnigentCli.localServerHealthy(),
+    ]);
     return {
-      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      ...status,
       customizationDisabled: databricksInternalFeaturesEnabled(),
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
       // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
-      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
+      localServerRunning: localUrl !== null,
     };
   });
 
@@ -4238,7 +4245,12 @@ async function handleDeepLink(raw) {
 // ---------------------------------------------------------------------------
 
 // Name drives the macOS app menu title and the notification source name.
-app.setName("Omnigent");
+app.setName(isDevBuild ? "Omnigent Dev" : "Omnigent");
+if (isDevBuild) {
+  const devData = path.join(app.getPath("appData"), "Omnigent Dev");
+  fs.mkdirSync(devData, { recursive: true });
+  app.setPath("userData", devData);
+}
 
 // Single-instance: focus the existing window instead of opening a second.
 const gotLock = app.requestSingleInstanceLock();
@@ -4292,7 +4304,8 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     // App User Model ID so Windows attributes notifications/taskbar correctly.
-    if (process.platform === "win32") app.setAppUserModelId("ai.omnigent.desktop");
+    if (process.platform === "win32")
+      app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();

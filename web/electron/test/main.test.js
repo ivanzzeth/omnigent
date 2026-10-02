@@ -44,6 +44,7 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  loadServer = async () => {},
   managedServers = [],
   internalFeatures = false,
   cliPath = null,
@@ -64,6 +65,7 @@ function loadNavigationHarness({
     auth: [],
     manifests: [],
     progress: [],
+    loading: [],
     reloads: 0,
     arcaConnects: [],
   };
@@ -137,7 +139,7 @@ function loadNavigationHarness({
     },
     loadURL: (...args) => {
       calls.loadURL.push(args);
-      return Promise.resolve();
+      return loadServer(...args);
     },
   };
 
@@ -158,6 +160,7 @@ function loadNavigationHarness({
       isPackaged: false,
       getPath: () => userData,
       setName: () => {},
+      setPath: () => {},
       setBadgeCount: () => true,
       requestSingleInstanceLock: () => true,
       on: (eventName, listener) => appEvents.set(eventName, listener),
@@ -211,6 +214,12 @@ function loadNavigationHarness({
 
   const localRequires = {
     "./desktop_updater": { createDesktopUpdater },
+    "./connection_loading": {
+      createConnectionLoading: () => ({
+        show: (_win, attempt, label) => calls.loading.push({ action: "show", attempt, label }),
+        hide: (_win, attempt) => calls.loading.push({ action: "hide", attempt }),
+      }),
+    },
     "./update_overlay": {
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
@@ -1279,7 +1288,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target\)[\s\S]{0,150}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -1772,7 +1781,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
   it("reports the local server as running only when start-local would reuse it", () => {
     assert.match(
       liveCode,
-      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,900}localServerRunning:\s*\(await omnigentCli\.localServerHealthy\(\)\) !== null/,
+      /ipcMain\.handle\("omnigent:get-cli-status"[\s\S]{0,300}Promise\.all\(\[[\s\S]{0,120}omnigentCli\.localServerHealthy\(\),[\s\S]{0,600}localServerRunning:\s*localUrl !== null/,
     );
   });
 });
@@ -2222,4 +2231,51 @@ describe("onboarding runner IPC", () => {
       assert.equal(settings(h).onboarding_runner, undefined);
     });
   });
+});
+
+it("keeps native feedback through cold authentication and the server document load", async (t) => {
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  let finishAuth, finishLoad;
+  const auth = new Promise((resolve) => {
+    finishAuth = resolve;
+  });
+  const load = new Promise((resolve) => {
+    finishLoad = resolve;
+  });
+  const target = "https://workspace.cloud.databricks.com/omnigent";
+  const h = loadNavigationHarness({
+    serverUrl: target,
+    databricksMode: "browser",
+    ensureSession: () => auth,
+    loadServer: () => load,
+  });
+  t.after(h.cleanup);
+  const pending = h.api.loadServerUrl(h.win, target);
+  await tick();
+  assert.equal(h.calls.loading.at(-1).label, "Signing in…");
+  assert.equal(h.calls.loadURL.length, 0);
+  finishAuth(new URL(target).origin);
+  await tick();
+  assert.equal(h.calls.loading.at(-1).label, "Opening Omnigent…");
+  assert.equal(h.calls.loadURL.length, 1);
+  const attempt = h.calls.loading.at(-1).attempt;
+  finishLoad();
+  await pending;
+  assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt });
+});
+
+it("dismisses native loading feedback when the server document fails", async (t) => {
+  const h = loadNavigationHarness({
+    loadServer: async () => {
+      throw new Error("connection lost");
+    },
+  });
+  t.after(h.cleanup);
+  await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
+  const shown = h.calls.loading.find((call) => call.action === "show");
+  assert.equal(shown.label, "Opening Omnigent…");
+  assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
 });
