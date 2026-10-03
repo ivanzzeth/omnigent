@@ -155,18 +155,19 @@ _AGENT_METHOD_SET_MODEL = "session/set_model"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
-# Idle (time-without-progress) timeout for a prompt turn, in seconds.
-# Some ACP agents stay silent while an external interaction is pending, so
-# this is configurable. Parsing is import-time and fail-loud: a malformed,
-# non-positive, or non-finite value aborts the ACP child at startup.
+# Optional ACP-local idle timeout for a prompt turn, in seconds. The harness
+# watchdog owns the default progress deadline; ACP agents may legitimately stay
+# silent while a long-running tool executes. Set a positive value only for
+# diagnostics. Zero or an unset variable disables this inner timeout.
 _PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
-_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds"
+_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a non-negative finite number of seconds"
 try:
-    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
+    _prompt_timeout_value = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "0"))
 except ValueError as exc:
     raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
-if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
+if not math.isfinite(_prompt_timeout_value) or _prompt_timeout_value < 0:
     raise ValueError(_PROMPT_TIMEOUT_ERR)
+_PROMPT_TIMEOUT_SECONDS: float | None = _prompt_timeout_value or None
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
@@ -1848,13 +1849,15 @@ class AcpExecutor(Executor):
             }
         )
 
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        deadline = (
+            loop.time() + _PROMPT_TIMEOUT_SECONDS if _PROMPT_TIMEOUT_SECONDS is not None else None
+        )
         accumulated_text: list[str] = []
 
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
+            remaining = deadline - loop.time() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                yield ExecutorError(message="Timeout waiting for ACP response", retryable=False)
                 return
 
             # Complete only once the future is resolved AND the queue is drained,
@@ -1880,7 +1883,8 @@ class AcpExecutor(Executor):
 
             try:
                 notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
+                    self._queue.get(),
+                    timeout=min(remaining, 2.0) if remaining is not None else 2.0,
                 )
             except asyncio.TimeoutError:
                 continue
@@ -1900,7 +1904,8 @@ class AcpExecutor(Executor):
                 await self._respond_to_agent_request(notification)
 
             # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+            if _PROMPT_TIMEOUT_SECONDS is not None:
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
