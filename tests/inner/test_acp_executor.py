@@ -1881,6 +1881,91 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
     assert tool_done[0].status is ToolCallStatus.SUCCESS
 
 
+@pytest.mark.asyncio
+async def test_long_silent_tool_call_uses_outer_watchdog(tmp_path: Path) -> None:
+    """An ACP tool may stay silent longer than the former inner deadline."""
+    agent_path = tmp_path / "slow_tool_acp_agent.py"
+    agent_path.write_text(
+        "import json, sys, time\n"
+        "def send(value):\n"
+        "    sys.stdout.write(json.dumps(value) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'sessionId': 'slow-tool-session'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = msg['params']['sessionId']\n"
+        "        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid, 'update': {'sessionUpdate': 'tool_call',\n"
+        "            'toolCallId': 'compile', 'title': 'compile', 'kind': 'execute',\n"
+        "            'status': 'in_progress', 'rawInput': {'command': 'cargo test'}}}})\n"
+        "        time.sleep(0.15)\n"
+        "        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid, 'update': {'sessionUpdate': 'tool_call_update',\n"
+        "            'toolCallId': 'compile', 'status': 'completed'}}})\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'stopReason': 'end_turn'}})\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="SlowTool"))
+
+    events = []
+    with patch.object(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", None):
+        try:
+            async for event in ex.run_turn([{"role": "user", "content": "compile"}], [], ""):
+                events.append(event)
+        finally:
+            await ex.close()
+
+    assert not any(isinstance(event, ExecutorError) for event in events)
+    assert sum(isinstance(event, TurnComplete) for event in events) == 1
+    assert sum(isinstance(event, ToolCallComplete) for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_prompt_timeout_is_terminal(tmp_path: Path) -> None:
+    """An opt-in ACP timeout must not transparently retry a side-effecting turn."""
+    agent_path = tmp_path / "silent_acp_agent.py"
+    agent_path.write_text(
+        "import json, sys, time\n"
+        "def send(value):\n"
+        "    sys.stdout.write(json.dumps(value) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'sessionId': 'silent-session'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        time.sleep(1)\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent"))
+
+    events = []
+    with patch.object(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", 0.05):
+        try:
+            async for event in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+                events.append(event)
+        finally:
+            await ex.close()
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert errors[0].message == "Timeout waiting for ACP response"
+    assert errors[0].retryable is False
+
+
 # ---------------------------------------------------------------------------
 # Omnigent MCP bridge (session/new.mcpServers via the shared serve-mcp relay)
 # ---------------------------------------------------------------------------

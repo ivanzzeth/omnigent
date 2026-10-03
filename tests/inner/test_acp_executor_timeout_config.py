@@ -31,7 +31,15 @@ def test_prompt_timeout_defaults_and_override() -> None:
             env=_subprocess_env(None),
             text=True,
         ).strip()
-        == "300.0"
+        == "None"
+    )
+    assert (
+        subprocess.check_output(
+            [sys.executable, "-c", _PRINT_TIMEOUT],
+            env=_subprocess_env("0"),
+            text=True,
+        ).strip()
+        == "None"
     )
     assert (
         subprocess.check_output(
@@ -56,7 +64,7 @@ def test_prompt_timeout_malformed_value_fails_loud() -> None:
     assert _TIMEOUT_ENV in result.stderr.strip().splitlines()[-1]
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
 def test_prompt_timeout_rejects_non_positive_or_non_finite_values(value: str) -> None:
     result = subprocess.run(
         [sys.executable, "-c", _PRINT_TIMEOUT],
