@@ -41,9 +41,27 @@ class _GenerateBuildInfo(build_py):
         """Build the web UI, generate ``_build_info.py``, then run build_py."""
         self._build_web_ui()
         self._write_build_info()
+        self._clear_stale_package_build()
         super().run()
         self._bundle_examples()
         self._bundle_scripts()
+
+    def _clear_stale_package_build(self) -> None:
+        """Remove copied package files left by an earlier checkout.
+
+        Setuptools incrementally populates the build directory and does not
+        remove files that disappeared from the current source tree. Reusing a
+        clone across branches can therefore put migrations or runtime modules
+        from another revision into an otherwise valid wheel. Clear only our
+        package subtree immediately before copying the current sources.
+        """
+        import shutil
+
+        package_build = Path(self.build_lib) / "omnigent"
+        if package_build.is_symlink() or package_build.is_file():
+            package_build.unlink()
+        elif package_build.is_dir():
+            shutil.rmtree(package_build)
 
     def _bundle_scripts(self) -> None:
         """Copy top-level maintenance scripts into package resources."""

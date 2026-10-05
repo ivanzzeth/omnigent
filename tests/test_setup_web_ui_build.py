@@ -126,6 +126,23 @@ def test_skip_web_ui_bypasses_node_gate(monkeypatch: pytest.MonkeyPatch) -> None
     require_node.assert_not_called()
 
 
+def test_build_hook_removes_stale_package_tree_only(tmp_path: Path) -> None:
+    module = _load_setup_module()
+    build_lib = tmp_path / "build" / "lib"
+    stale = build_lib / "omnigent" / "db" / "migrations" / "stale.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("from another branch")
+    unrelated = build_lib / "other_package" / "keep.py"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("keep")
+
+    command = type("Command", (), {"build_lib": str(build_lib)})()
+    module._GenerateBuildInfo._clear_stale_package_build(command)
+
+    assert not (build_lib / "omnigent").exists()
+    assert unrelated.read_text() == "keep"
+
+
 def test_newer_node_build_failure_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_setup_module()
     monkeypatch.delenv("OMNIGENT_SKIP_WEB_UI", raising=False)
