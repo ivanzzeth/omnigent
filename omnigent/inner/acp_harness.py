@@ -51,6 +51,10 @@ Env vars read at startup:
   fully own their own system prompt — prepending Omnigent's text can cause the agent's
   internal Claude model to emit XML tool-call fragments when no MCP relay is backing the
   described tools (see ``omnigent_mcp``). Defaults to ``"1"`` (inject).
+- ``HARNESS_ACP_PROVIDER_ATTEMPTS``: optional JSON array of provider attempts.
+  Each item has a display ``name`` and non-sensitive string ``env`` overrides
+  used to restart the wrapper. Two or more entries enable failover before the
+  first output or side effect; credentials must not be placed in this value.
 """
 
 from __future__ import annotations
@@ -64,6 +68,11 @@ from fastapi import FastAPI
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
+from omnigent.inner.acp_provider_failover import (
+    AcpProviderAttempt,
+    AcpProviderFailoverSupervisor,
+    parse_provider_attempts,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
@@ -85,6 +94,7 @@ _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
 _ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
+_ENV_PROVIDER_ATTEMPTS = "HARNESS_ACP_PROVIDER_ATTEMPTS"
 _DEFAULT_PERMISSION_MODE = "auto"
 
 
@@ -150,7 +160,11 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
+def _build_acp_executor(
+    extension: AcpExtension = NO_ACP_EXTENSION,
+    *,
+    spawn_env_overrides: dict[str, str] | None = None,
+) -> Executor:
     """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn).
 
     :param extension: Vendor behavior to inject, from the calling wrap. Defaults
@@ -184,8 +198,21 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         env_unset=_csv_names(_ENV_ENV_UNSET),
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
+        spawn_env_overrides=spawn_env_overrides or {},
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
+
+
+def _build_harness_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
+    attempts = parse_provider_attempts(os.environ.get(_ENV_PROVIDER_ATTEMPTS))
+    if len(attempts) < 2:
+        overrides = dict(attempts[0].env) if attempts else None
+        return _build_acp_executor(extension, spawn_env_overrides=overrides)
+
+    def factory(attempt: AcpProviderAttempt) -> Executor:
+        return _build_acp_executor(extension, spawn_env_overrides=dict(attempt.env))
+
+    return AcpProviderFailoverSupervisor(attempts, factory)
 
 
 def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
@@ -204,6 +231,6 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
     adapter = ExecutorAdapter(
-        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
+        executor_factory=lambda: _build_harness_executor(extension), harness_label=label
     )
     return adapter.build()
