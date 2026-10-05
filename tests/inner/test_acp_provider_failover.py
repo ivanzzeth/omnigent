@@ -42,6 +42,7 @@ class _ScriptedExecutor(Executor):
         self._policy_evaluator = None
         self._elicitation_handler = None
         self._elicitation_choice_handler = None
+        self._side_effect_observer = None
 
     async def run_turn(self, messages, tools, system_prompt, config=None) -> AsyncIterator[object]:
         self.lifecycle.append(f"run:{self.name}:{messages[-1]['content']}")
@@ -61,8 +62,8 @@ def _supervisor(
     close_error: Exception | None = None,
 ) -> AcpProviderFailoverSupervisor:
     attempts = (
-        AcpProviderAttempt(name="primary", env={"LINGXIAO_ATTEMPT": "0"}),
-        AcpProviderAttempt(name="fallback", env={"LINGXIAO_ATTEMPT": "1"}),
+        AcpProviderAttempt(name="primary", env={"LINGXIAO_MODEL_ATTEMPT": "0"}),
+        AcpProviderAttempt(name="fallback", env={"LINGXIAO_MODEL_ATTEMPT": "1"}),
     )
 
     def factory(attempt: AcpProviderAttempt) -> Executor:
@@ -85,14 +86,29 @@ async def _collect(supervisor: Executor) -> list[object]:
 
 def test_attempt_json_accepts_only_named_string_env_overrides() -> None:
     attempts = parse_provider_attempts(
-        '[{"name":"primary","env":{"LINGXIAO_ATTEMPT":"0"}}]'
+        '[{"name":"primary","env":{"LINGXIAO_MODEL_ATTEMPT":"0"},"model":"fallback/model"}]'
     )
     assert attempts == (
-        AcpProviderAttempt(name="primary", env={"LINGXIAO_ATTEMPT": "0"}),
+        AcpProviderAttempt(
+            name="primary",
+            env={"LINGXIAO_MODEL_ATTEMPT": "0"},
+            model="fallback/model",
+        ),
     )
 
-    with pytest.raises(ValueError, match="string environment overrides"):
+    with pytest.raises(ValueError, match="non-secret selector"):
         parse_provider_attempts('[{"name":"bad","env":{"SECRET":1}}]')
+    with pytest.raises(ValueError, match="non-secret selector"):
+        parse_provider_attempts('[{"name":"bad","env":{"OPENAI_API_KEY":"leak"}}]')
+
+
+def test_plain_authorization_errors_are_not_assumed_to_be_provider_failures() -> None:
+    from omnigent.inner.acp_provider_failover import is_recoverable_provider_error
+
+    assert not is_recoverable_provider_error(
+        ExecutorError(message="workspace operation forbidden", retryable=True)
+    )
+    assert not is_recoverable_provider_error(ExecutorError(message="unauthorized", retryable=True))
 
 
 @pytest.mark.asyncio
@@ -121,13 +137,9 @@ async def test_provider_failure_before_output_closes_then_replays_same_turn() ->
 @pytest.mark.asyncio
 async def test_structured_provider_timeout_switches_but_generic_acp_timeout_does_not() -> None:
     switching_lifecycle: list[str] = []
-    provider_timeout = ExecutorError(
-        message="provider upstream timed out", retryable=True
-    )
+    provider_timeout = ExecutorError(message="provider upstream timed out", retryable=True)
     switched = await _collect(
-        _supervisor(
-            [[provider_timeout], [TurnComplete(response="ok")]], switching_lifecycle
-        )
+        _supervisor([[provider_timeout], [TurnComplete(response="ok")]], switching_lifecycle)
     )
     assert switched == [TurnComplete(response="ok")]
     assert switching_lifecycle == [
@@ -139,13 +151,9 @@ async def test_structured_provider_timeout_switches_but_generic_acp_timeout_does
     ]
 
     generic_lifecycle: list[str] = []
-    generic_timeout = ExecutorError(
-        message="Timeout waiting for ACP response", retryable=True
-    )
+    generic_timeout = ExecutorError(message="Timeout waiting for ACP response", retryable=True)
     not_switched = await _collect(
-        _supervisor(
-            [[generic_timeout], [TurnComplete(response="wrong")]], generic_lifecycle
-        )
+        _supervisor([[generic_timeout], [TurnComplete(response="wrong")]], generic_lifecycle)
     )
     assert not_switched == [generic_timeout]
     assert generic_lifecycle == ["create:primary", "run:primary:same turn"]
@@ -154,13 +162,9 @@ async def test_structured_provider_timeout_switches_but_generic_acp_timeout_does
 @pytest.mark.asyncio
 async def test_provider_auth_failure_switches_even_when_same_provider_is_not_retryable() -> None:
     lifecycle: list[str] = []
-    auth_error = ExecutorError(
-        message="provider authentication failed: HTTP 401", retryable=False
-    )
+    auth_error = ExecutorError(message="provider authentication failed: HTTP 401", retryable=False)
 
-    events = await _collect(
-        _supervisor([[auth_error], [TurnComplete(response="ok")]], lifecycle)
-    )
+    events = await _collect(_supervisor([[auth_error], [TurnComplete(response="ok")]], lifecycle))
 
     assert events == [TurnComplete(response="ok")]
     assert "create:fallback" in lifecycle
@@ -214,6 +218,38 @@ async def test_elicitation_callback_disables_failover_even_without_an_event() ->
         async def run(*args, **kwargs):
             assert executor._elicitation_handler is not None
             await executor._elicitation_handler("bash", {})
+            async for item in original_run(*args, **kwargs):
+                yield item
+
+        executor.run_turn = run
+        return executor
+
+    supervisor._factory = factory
+    events = await _collect(supervisor)
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert lifecycle == ["create:primary", "run:primary:same turn"]
+
+
+@pytest.mark.asyncio
+async def test_native_acp_side_effect_callback_disables_failover() -> None:
+    lifecycle: list[str] = []
+    supervisor = _supervisor(
+        [
+            [ExecutorError(message="provider HTTP 503", retryable=True)],
+            [TurnComplete(response="wrong")],
+        ],
+        lifecycle,
+    )
+    original_factory = supervisor._factory
+
+    def factory(attempt):
+        executor = original_factory(attempt)
+        original_run = executor.run_turn
+
+        async def run(*args, **kwargs):
+            assert executor._side_effect_observer is not None
+            executor._side_effect_observer()
             async for item in original_run(*args, **kwargs):
                 yield item
 
@@ -290,9 +326,7 @@ def test_harness_single_attempt_keeps_plain_executor_with_overrides(
     executor = acp_harness._build_harness_executor()
 
     assert type(executor) is AcpExecutor
-    assert executor._config.spawn_env_overrides == {
-        "LINGXIAO_ACP_PROVIDER_ATTEMPT": "primary"
-    }
+    assert executor._config.spawn_env_overrides == {"LINGXIAO_ACP_PROVIDER_ATTEMPT": "primary"}
 
 
 def test_harness_multiple_attempts_builds_supervisor(
@@ -310,3 +344,25 @@ def test_harness_multiple_attempts_builds_supervisor(
     executor = acp_harness._build_harness_executor()
 
     assert isinstance(executor, AcpProviderFailoverSupervisor)
+
+
+def test_harness_attempt_model_overrides_primary_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "wrapper acp")
+    monkeypatch.setenv("HARNESS_ACP_MODEL", "lingxiao/primary")
+    monkeypatch.setenv(
+        "HARNESS_ACP_PROVIDER_ATTEMPTS",
+        """[
+            {"name":"primary","env":{"LINGXIAO_MODEL_ATTEMPT":"0"},"model":"lingxiao/primary"},
+            {"name":"fallback","env":{"LINGXIAO_MODEL_ATTEMPT":"1"},"model":"lingxiao/fallback"}
+        ]""",
+    )
+
+    supervisor = acp_harness._build_harness_executor()
+    assert isinstance(supervisor, AcpProviderFailoverSupervisor)
+    supervisor._attempt_index = 1
+    fallback = supervisor._build_active()
+
+    assert isinstance(fallback, AcpExecutor)
+    assert fallback._config.model == "lingxiao/fallback"
