@@ -54,8 +54,8 @@ import os
 import secrets
 import shlex
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
@@ -171,6 +171,7 @@ _PROMPT_TIMEOUT_SECONDS: float | None = _prompt_timeout_value or None
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
+_FAILOVER_REAP_TIMEOUT_SECONDS = 5.0
 
 # Agent stderr kept for diagnostics: how many trailing lines to retain, how many
 # to quote in a turn error, and the per-line cap (a chatty CLI can emit one
@@ -245,6 +246,10 @@ class AcpAgentConfig:
     :param default_model: Model to restore when a per-turn override is cleared.
         ``None`` preserves the launch-model fallback; an empty string uses the
         model originally reported by the ACP session.
+    :param spawn_env_overrides: Non-secret wrapper selectors applied after the
+        deny-by-default spawn environment is built. Used by the ACP harness's
+        provider-attempt supervisor; credentials must use their existing secret
+        channel instead.
     """
 
     command: str
@@ -259,6 +264,7 @@ class AcpAgentConfig:
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
     default_model: str | None = None
+    spawn_env_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 class _AcpModelSwitchError(RuntimeError):
@@ -724,7 +730,7 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
+        env = clean_agent_env(
             allow_prefixes=(),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
@@ -732,6 +738,8 @@ class AcpExecutor(Executor):
             ),
             deny_exact=getattr(config, "env_unset", ()),
         )
+        env.update(getattr(config, "spawn_env_overrides", {}))
+        return env
 
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
@@ -1932,10 +1940,9 @@ class AcpExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
-    async def close(self) -> None:
-        """Terminate the agent subprocess and clean up."""
+    async def _close_resources(self) -> None:
+        """Stop non-process resources shared by normal and strict teardown."""
         self._reset_session_state()
-        # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
         if self._reader_task:
@@ -1952,6 +1959,43 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._os_environment.close()
             self._os_environment = None
+
+    async def close_for_failover(self) -> None:
+        """Close and prove the old ACP process tree is gone before replacement."""
+        await self._close_resources()
+        proc = self._proc
+        if proc is None:
+            return
+
+        tracked = _proc.capture_process_tree(proc)
+        with contextlib.suppress(Exception):
+            proc.stdin.close()  # type: ignore[union-attr]
+        _proc.terminate_tree(proc)
+        tracked.update(_proc.capture_process_tree(proc))
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_FAILOVER_REAP_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - force-kill after any failed reap
+            _proc.kill_tree(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_FAILOVER_REAP_TIMEOUT_SECONDS)
+            except Exception as exc:
+                raise RuntimeError("ACP subprocess did not exit after forced termination") from exc
+        else:
+            # A launcher exiting does not prove its detached descendants exited.
+            _proc.kill_tree(proc)
+
+        deadline = (
+            asyncio.get_running_loop().time() + _FAILOVER_REAP_TIMEOUT_SECONDS
+        )
+        while _proc.process_identities_alive(tracked):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("ACP process tree remained alive after forced termination")
+            await asyncio.sleep(0.05)
+        self._proc = None
+
+    async def close(self) -> None:
+        """Terminate the agent subprocess and clean up, best effort."""
+        await self._close_resources()
         if self._proc:
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
