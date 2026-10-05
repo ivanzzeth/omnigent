@@ -144,7 +144,10 @@ def is_recoverable_provider_error(error: ExecutorError) -> bool:
     message = error.message.casefold()
     if any(marker in message for marker in _NON_PROVIDER_MARKERS):
         return False
-    code = (error.code or "").casefold()
+    # ExecutorError gained a semantic ``code`` field after Omnigent 0.15.
+    # Keep this stable-series backport compatible while still honoring the
+    # field when a harness attaches it dynamically.
+    code = (getattr(error, "code", None) or "").casefold()
     if code in _PROVIDER_ERROR_CODES or code.startswith("provider_5"):
         return True
     if any(marker in message for marker in _DIRECT_RECOVERABLE_MARKERS):

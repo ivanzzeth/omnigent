@@ -272,8 +272,21 @@ def capture_process_tree(process: _ProcessLike | None) -> dict[int, float]:
     """Capture stable identities for a process and all observable descendants."""
     if process is None or process.pid is None:
         return {}
-    refresh_process_tree(process)
-    return _remember_identities(process, {})
+    identities: dict[int, float] = {}
+    try:
+        root = psutil.Process(process.pid)
+        observed = [root, *root.children(recursive=True)]
+    except psutil.NoSuchProcess:
+        return identities
+    except psutil.AccessDenied:
+        observed = []
+
+    for proc in observed:
+        try:
+            identities[proc.pid] = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return identities
 
 
 def process_identities_alive(identities: dict[int, float]) -> bool:

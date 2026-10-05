@@ -122,7 +122,7 @@ async def test_provider_failure_before_output_closes_then_replays_same_turn() ->
 async def test_structured_provider_timeout_switches_but_generic_acp_timeout_does_not() -> None:
     switching_lifecycle: list[str] = []
     provider_timeout = ExecutorError(
-        message="upstream timed out", retryable=True, code="provider_timeout"
+        message="provider upstream timed out", retryable=True
     )
     switched = await _collect(
         _supervisor(
