@@ -921,6 +921,34 @@ async def test_decide_permission_allows_with_no_gates() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("session/request_permission", {"toolCall": {"title": "shell"}}),
+        ("fs/write_text_file", {"path": "note.txt", "content": "changed"}),
+    ],
+)
+async def test_native_side_effect_requests_notify_failover_supervisor(
+    method: str, params: dict[str, object]
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    observed: list[str] = []
+    ex._side_effect_observer = lambda: observed.append(method)
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    if method == "fs/write_text_file":
+        ex._fs_delegation = True
+        environment = AsyncMock()
+        environment.write.return_value = {}
+        ex._ensure_os_environment = AsyncMock(return_value=environment)  # type: ignore[method-assign]
+
+    await ex._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    )
+
+    assert observed == [method]
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_denies_on_policy_deny() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 
@@ -1881,6 +1909,91 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
     assert tool_done[0].status is ToolCallStatus.SUCCESS
 
 
+@pytest.mark.asyncio
+async def test_long_silent_tool_call_uses_outer_watchdog(tmp_path: Path) -> None:
+    """An ACP tool may stay silent longer than the former inner deadline."""
+    agent_path = tmp_path / "slow_tool_acp_agent.py"
+    agent_path.write_text(
+        "import json, sys, time\n"
+        "def send(value):\n"
+        "    sys.stdout.write(json.dumps(value) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'sessionId': 'slow-tool-session'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = msg['params']['sessionId']\n"
+        "        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid, 'update': {'sessionUpdate': 'tool_call',\n"
+        "            'toolCallId': 'compile', 'title': 'compile', 'kind': 'execute',\n"
+        "            'status': 'in_progress', 'rawInput': {'command': 'cargo test'}}}})\n"
+        "        time.sleep(0.15)\n"
+        "        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid, 'update': {'sessionUpdate': 'tool_call_update',\n"
+        "            'toolCallId': 'compile', 'status': 'completed'}}})\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'stopReason': 'end_turn'}})\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="SlowTool"))
+
+    events = []
+    with patch.object(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", None):
+        try:
+            async for event in ex.run_turn([{"role": "user", "content": "compile"}], [], ""):
+                events.append(event)
+        finally:
+            await ex.close()
+
+    assert not any(isinstance(event, ExecutorError) for event in events)
+    assert sum(isinstance(event, TurnComplete) for event in events) == 1
+    assert sum(isinstance(event, ToolCallComplete) for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_prompt_timeout_is_terminal(tmp_path: Path) -> None:
+    """An opt-in ACP timeout must not transparently retry a side-effecting turn."""
+    agent_path = tmp_path / "silent_acp_agent.py"
+    agent_path.write_text(
+        "import json, sys, time\n"
+        "def send(value):\n"
+        "    sys.stdout.write(json.dumps(value) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': {}}})\n"
+        "    elif method == 'session/new':\n"
+        "        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {\n"
+        "            'sessionId': 'silent-session'}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        time.sleep(1)\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent"))
+
+    events = []
+    with patch.object(acp_executor_module, "_PROMPT_TIMEOUT_SECONDS", 0.05):
+        try:
+            async for event in ex.run_turn([{"role": "user", "content": "wait"}], [], ""):
+                events.append(event)
+        finally:
+            await ex.close()
+
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1
+    assert errors[0].message == "Timeout waiting for ACP response"
+    assert errors[0].retryable is False
+
+
 # ---------------------------------------------------------------------------
 # Omnigent MCP bridge (session/new.mcpServers via the shared serve-mcp relay)
 # ---------------------------------------------------------------------------
@@ -2385,6 +2498,61 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
     while _proc.process_alive(grandchild):
         assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
         await asyncio.sleep(0.05)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_for_failover_returns_only_after_process_tree_exits(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    parent = ex._proc
+    assert parent is not None
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+
+    await ex.close_for_failover()
+
+    assert parent.returncode is not None
+    assert not _proc.process_alive(grandchild)
+    assert ex._proc is None
+
+
+@pytest.mark.asyncio
+async def test_close_for_failover_keeps_handle_when_tree_exit_cannot_be_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    proc = AsyncMock()
+    proc.pid = 12345
+    proc.returncode = 0
+    proc.stdin = Mock()
+    ex._proc = proc
+    monkeypatch.setattr(acp_executor_module, "_FAILOVER_REAP_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "capture_process_tree", Mock(return_value={12345: 1.0}))
+    monkeypatch.setattr(_proc, "terminate_tree", Mock())
+    monkeypatch.setattr(_proc, "kill_tree", Mock())
+    monkeypatch.setattr(_proc, "process_identities_alive", Mock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="process tree remained alive"):
+        await ex.close_for_failover()
+
+    assert ex._proc is proc
 
 
 # ── Curated model list gate + spawn-env denylist ────────────────────────────

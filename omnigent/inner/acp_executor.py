@@ -54,8 +54,8 @@ import os
 import secrets
 import shlex
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
@@ -155,21 +155,23 @@ _AGENT_METHOD_SET_MODEL = "session/set_model"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
-# Idle (time-without-progress) timeout for a prompt turn, in seconds.
-# Some ACP agents stay silent while an external interaction is pending, so
-# this is configurable. Parsing is import-time and fail-loud: a malformed,
-# non-positive, or non-finite value aborts the ACP child at startup.
+# Optional ACP-local idle timeout for a prompt turn, in seconds. The harness
+# watchdog owns the default progress deadline; ACP agents may legitimately stay
+# silent while a long-running tool executes. Set a positive value only for
+# diagnostics. Zero or an unset variable disables this inner timeout.
 _PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
-_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds"
+_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a non-negative finite number of seconds"
 try:
-    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
+    _prompt_timeout_value = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "0"))
 except ValueError as exc:
     raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
-if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
+if not math.isfinite(_prompt_timeout_value) or _prompt_timeout_value < 0:
     raise ValueError(_PROMPT_TIMEOUT_ERR)
+_PROMPT_TIMEOUT_SECONDS: float | None = _prompt_timeout_value or None
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
+_FAILOVER_REAP_TIMEOUT_SECONDS = 5.0
 
 # Agent stderr kept for diagnostics: how many trailing lines to retain, how many
 # to quote in a turn error, and the per-line cap (a chatty CLI can emit one
@@ -244,6 +246,10 @@ class AcpAgentConfig:
     :param default_model: Model to restore when a per-turn override is cleared.
         ``None`` preserves the launch-model fallback; an empty string uses the
         model originally reported by the ACP session.
+    :param spawn_env_overrides: Non-secret wrapper selectors applied after the
+        deny-by-default spawn environment is built. Used by the ACP harness's
+        provider-attempt supervisor; credentials must use their existing secret
+        channel instead.
     """
 
     command: str
@@ -258,6 +264,7 @@ class AcpAgentConfig:
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
     default_model: str | None = None
+    spawn_env_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 class _AcpModelSwitchError(RuntimeError):
@@ -482,6 +489,10 @@ class AcpExecutor(Executor):
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
+        # Provider failover supervisor installs this callback. Native ACP writes and
+        # permission decisions bypass the ordinary tool bridge, so they must announce
+        # their side-effect boundary explicitly before a turn can be replayed.
+        self._side_effect_observer: Callable[[], None] | None = None
 
         # Omnigent-tool MCP bridge — exposes builtin tools to the agent via
         # session/new.mcpServers (lazily started at first session; torn down in
@@ -723,7 +734,7 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
+        env = clean_agent_env(
             allow_prefixes=(),
             extra_allowed=(
                 *getattr(config, "env_passthrough", ()),
@@ -731,6 +742,8 @@ class AcpExecutor(Executor):
             ),
             deny_exact=getattr(config, "env_unset", ()),
         )
+        env.update(getattr(config, "spawn_env_overrides", {}))
+        return env
 
     def _warn_initialize_failed(self, reason: str) -> None:
         """Point a failed handshake at the env allowlist.
@@ -972,11 +985,15 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
+                if self._side_effect_observer is not None:
+                    self._side_effect_observer()
                 allow, option_id = await self._decide_permission(params)
                 result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
+                if self._side_effect_observer is not None:
+                    self._side_effect_observer()
                 result = await self._handle_fs_write(params)
             else:
                 error = {
@@ -1848,13 +1865,15 @@ class AcpExecutor(Executor):
             }
         )
 
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        deadline = (
+            loop.time() + _PROMPT_TIMEOUT_SECONDS if _PROMPT_TIMEOUT_SECONDS is not None else None
+        )
         accumulated_text: list[str] = []
 
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
+            remaining = deadline - loop.time() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                yield ExecutorError(message="Timeout waiting for ACP response", retryable=False)
                 return
 
             # Complete only once the future is resolved AND the queue is drained,
@@ -1880,7 +1899,8 @@ class AcpExecutor(Executor):
 
             try:
                 notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
+                    self._queue.get(),
+                    timeout=min(remaining, 2.0) if remaining is not None else 2.0,
                 )
             except asyncio.TimeoutError:
                 continue
@@ -1900,7 +1920,8 @@ class AcpExecutor(Executor):
                 await self._respond_to_agent_request(notification)
 
             # Inbound message = progress; reset the idle deadline.
-            deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+            if _PROMPT_TIMEOUT_SECONDS is not None:
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
@@ -1927,10 +1948,9 @@ class AcpExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
-    async def close(self) -> None:
-        """Terminate the agent subprocess and clean up."""
+    async def _close_resources(self) -> None:
+        """Stop non-process resources shared by normal and strict teardown."""
         self._reset_session_state()
-        # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
         if self._reader_task:
@@ -1947,6 +1967,41 @@ class AcpExecutor(Executor):
             with contextlib.suppress(Exception):
                 self._os_environment.close()
             self._os_environment = None
+
+    async def close_for_failover(self) -> None:
+        """Close and prove the old ACP process tree is gone before replacement."""
+        await self._close_resources()
+        proc = self._proc
+        if proc is None:
+            return
+
+        tracked = _proc.capture_process_tree(proc)
+        with contextlib.suppress(Exception):
+            proc.stdin.close()  # type: ignore[union-attr]
+        _proc.terminate_tree(proc)
+        tracked.update(_proc.capture_process_tree(proc))
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_FAILOVER_REAP_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - force-kill after any failed reap
+            _proc.kill_tree(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_FAILOVER_REAP_TIMEOUT_SECONDS)
+            except Exception as exc:
+                raise RuntimeError("ACP subprocess did not exit after forced termination") from exc
+        else:
+            # A launcher exiting does not prove its detached descendants exited.
+            _proc.kill_tree(proc)
+
+        deadline = asyncio.get_running_loop().time() + _FAILOVER_REAP_TIMEOUT_SECONDS
+        while _proc.process_identities_alive(tracked):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("ACP process tree remained alive after forced termination")
+            await asyncio.sleep(0.05)
+        self._proc = None
+
+    async def close(self) -> None:
+        """Terminate the agent subprocess and clean up, best effort."""
+        await self._close_resources()
         if self._proc:
             with contextlib.suppress(Exception):
                 self._proc.stdin.close()  # type: ignore[union-attr]
