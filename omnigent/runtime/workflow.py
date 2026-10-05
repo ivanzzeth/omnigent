@@ -1798,6 +1798,17 @@ def _build_acp_spawn_env(
         model = embedded.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("executor acp_agent model must be a string or null")
+        provider_attempts = embedded.get("provider_attempts")
+        if provider_attempts is not None:
+            # The harness parser performs the detailed shape validation. Keep
+            # this channel non-secret: it contains selectors only, never keys.
+            if not isinstance(provider_attempts, list) or len(provider_attempts) < 2:
+                raise ValueError(
+                    "executor acp_agent provider_attempts must be an array with at least two items"
+                )
+            env["HARNESS_ACP_PROVIDER_ATTEMPTS"] = json.dumps(
+                provider_attempts, separators=(",", ":")
+            )
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),

@@ -2472,6 +2472,61 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
         await asyncio.sleep(0.05)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_for_failover_returns_only_after_process_tree_exits(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    parent = ex._proc
+    assert parent is not None
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+
+    await ex.close_for_failover()
+
+    assert parent.returncode is not None
+    assert not _proc.process_alive(grandchild)
+    assert ex._proc is None
+
+
+@pytest.mark.asyncio
+async def test_close_for_failover_keeps_handle_when_tree_exit_cannot_be_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    proc = AsyncMock()
+    proc.pid = 12345
+    proc.returncode = 0
+    proc.stdin = Mock()
+    ex._proc = proc
+    monkeypatch.setattr(acp_executor_module, "_FAILOVER_REAP_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(_proc, "capture_process_tree", Mock(return_value={12345: 1.0}))
+    monkeypatch.setattr(_proc, "terminate_tree", Mock())
+    monkeypatch.setattr(_proc, "kill_tree", Mock())
+    monkeypatch.setattr(_proc, "process_identities_alive", Mock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="process tree remained alive"):
+        await ex.close_for_failover()
+
+    assert ex._proc is proc
+
+
 # ── Curated model list gate + spawn-env denylist ────────────────────────────
 
 

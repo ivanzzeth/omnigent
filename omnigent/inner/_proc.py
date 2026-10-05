@@ -266,3 +266,25 @@ def process_alive(pid: int) -> bool:
     except psutil.AccessDenied:
         # Exists but belongs to another user / can't introspect -> alive.
         return True
+
+
+def capture_process_tree(process: _ProcessLike | None) -> dict[int, float]:
+    """Capture stable identities for a process and all observable descendants."""
+    if process is None or process.pid is None:
+        return {}
+    refresh_process_tree(process)
+    return _remember_identities(process, {})
+
+
+def process_identities_alive(identities: dict[int, float]) -> bool:
+    """Return whether any captured PID still names the same live process."""
+    for pid, create_time in identities.items():
+        try:
+            proc = psutil.Process(pid)
+            if proc.create_time() == create_time and proc.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            return True
+    return False
