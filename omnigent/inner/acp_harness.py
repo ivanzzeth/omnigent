@@ -164,6 +164,7 @@ def _build_acp_executor(
     extension: AcpExtension = NO_ACP_EXTENSION,
     *,
     spawn_env_overrides: dict[str, str] | None = None,
+    model_override: str | None = None,
 ) -> Executor:
     """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn).
 
@@ -177,7 +178,7 @@ def _build_acp_executor(
             f"Add one via `{cli_invocation()} setup` → configure harnesses → Custom ACP agent."
         )
     name = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
-    model = os.environ.get(_ENV_MODEL, "").strip() or None
+    model = model_override or os.environ.get(_ENV_MODEL, "").strip() or None
     session_id_mode = os.environ.get(_ENV_SESSION_ID_MODE, "").strip() or "server"
     send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
     omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
@@ -210,7 +211,11 @@ def _build_harness_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Execu
         return _build_acp_executor(extension, spawn_env_overrides=overrides)
 
     def factory(attempt: AcpProviderAttempt) -> Executor:
-        return _build_acp_executor(extension, spawn_env_overrides=dict(attempt.env))
+        return _build_acp_executor(
+            extension,
+            spawn_env_overrides=dict(attempt.env),
+            model_override=attempt.model,
+        )
 
     return AcpProviderFailoverSupervisor(attempts, factory)
 

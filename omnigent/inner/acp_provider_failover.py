@@ -37,6 +37,13 @@ from omnigent.inner.executor import (
 logger = logging.getLogger(__name__)
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SELECTOR_ENV_NAMES = frozenset(
+    {
+        "LINGXIAO_MODEL_ATTEMPT",
+        "LINGXIAO_ACP_PROVIDER_ATTEMPT",
+        "OMNIGENT_PROVIDER_ATTEMPT",
+    }
+)
 _RECOVERABLE_STATUS = re.compile(r"\b(?:401|403|429|5\d{2})\b")
 _PROVIDER_MARKERS = (
     "provider",
@@ -47,8 +54,6 @@ _PROVIDER_MARKERS = (
     "usage quota",
     "available accounts exhausted",
     "authentication failed",
-    "unauthorized",
-    "forbidden",
 )
 _DIRECT_RECOVERABLE_MARKERS = (
     "quota exceeded",
@@ -56,8 +61,6 @@ _DIRECT_RECOVERABLE_MARKERS = (
     "usage quota",
     "available accounts exhausted",
     "authentication failed",
-    "unauthorized",
-    "forbidden",
 )
 _PROVIDER_ERROR_CODES = {
     "authentication_error",
@@ -99,6 +102,7 @@ class AcpProviderAttempt:
 
     name: str
     env: Mapping[str, str]
+    model: str | None = None
 
 
 def parse_provider_attempts(raw: str | None) -> tuple[AcpProviderAttempt, ...]:
@@ -120,10 +124,11 @@ def parse_provider_attempts(raw: str | None) -> tuple[AcpProviderAttempt, ...]:
 
     attempts: list[AcpProviderAttempt] = []
     for item in payload:
-        if not isinstance(item, dict) or set(item) != {"name", "env"}:
-            raise ValueError("each ACP provider attempt requires only name and env")
+        if not isinstance(item, dict) or not set(item).issubset({"name", "env", "model"}):
+            raise ValueError("each ACP provider attempt accepts only name, env, and model")
         name = item.get("name")
         env = item.get("env")
+        model = item.get("model")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("ACP provider attempt names must be non-empty strings")
         if not isinstance(env, dict) or not env:
@@ -131,11 +136,18 @@ def parse_provider_attempts(raw: str | None) -> tuple[AcpProviderAttempt, ...]:
         if any(
             not isinstance(key, str)
             or _ENV_NAME.fullmatch(key) is None
+            or key not in _SELECTOR_ENV_NAMES
             or not isinstance(value, str)
             for key, value in env.items()
         ):
-            raise ValueError("ACP provider attempts require string environment overrides")
-        attempts.append(AcpProviderAttempt(name=name.strip(), env=dict(env)))
+            raise ValueError("ACP provider attempts allow only non-secret selector overrides")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            raise ValueError("ACP provider attempt model must be a non-empty string")
+        attempts.append(
+            AcpProviderAttempt(
+                name=name.strip(), env=dict(env), model=model.strip() if model else None
+            )
+        )
     return tuple(attempts)
 
 
@@ -196,6 +208,10 @@ class AcpProviderFailoverSupervisor(Executor):
         executor._elicitation_choice_handler = self._wrap_boundary_callback(  # type: ignore[attr-defined]
             self._elicitation_choice_handler
         )
+        executor._side_effect_observer = self._mark_side_effect  # type: ignore[attr-defined]
+
+    def _mark_side_effect(self) -> None:
+        self._side_effect_observed = True
 
     def _wrap_boundary_callback(self, callback: Any) -> Any:
         if callback is None:
@@ -270,9 +286,7 @@ class AcpProviderFailoverSupervisor(Executor):
             else False
         )
 
-    async def enqueue_session_message(
-        self, session_key: str, content: EnqueuedContent
-    ) -> bool:
+    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         return (
             await self._active.enqueue_session_message(session_key, content)
             if self._active is not None
@@ -280,15 +294,11 @@ class AcpProviderFailoverSupervisor(Executor):
         )
 
     def supports_live_message_queue(self) -> bool:
-        return (
-            self._active.supports_live_message_queue() if self._active is not None else False
-        )
+        return self._active.supports_live_message_queue() if self._active is not None else False
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return (
-            self._active.supports_tool_boundary_interrupt()
-            if self._active is not None
-            else False
+            self._active.supports_tool_boundary_interrupt() if self._active is not None else False
         )
 
     async def close_session(self, session_key: str) -> None:

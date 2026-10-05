@@ -160,8 +160,16 @@ def test_embedded_omnigent_mcp_flag_forwarded() -> None:
 
 def test_embedded_provider_attempts_reach_harness_without_credentials() -> None:
     attempts = [
-        {"name": "provider-1", "env": {"LINGXIAO_MODEL_ATTEMPT": "0"}},
-        {"name": "provider-2", "env": {"LINGXIAO_MODEL_ATTEMPT": "1"}},
+        {
+            "name": "provider-1",
+            "env": {"LINGXIAO_MODEL_ATTEMPT": "0"},
+            "model": "lingxiao/primary-model",
+        },
+        {
+            "name": "provider-2",
+            "env": {"LINGXIAO_MODEL_ATTEMPT": "1"},
+            "model": "lingxiao/fallback-model",
+        },
     ]
     env = _build_acp_spawn_env(
         _make_spec(

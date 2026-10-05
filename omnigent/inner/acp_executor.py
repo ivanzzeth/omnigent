@@ -489,6 +489,10 @@ class AcpExecutor(Executor):
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
         self._tool_executor: _ToolExecutor | None = None
+        # Provider failover supervisor installs this callback. Native ACP writes and
+        # permission decisions bypass the ordinary tool bridge, so they must announce
+        # their side-effect boundary explicitly before a turn can be replayed.
+        self._side_effect_observer: Callable[[], None] | None = None
 
         # Omnigent-tool MCP bridge — exposes builtin tools to the agent via
         # session/new.mcpServers (lazily started at first session; torn down in
@@ -981,11 +985,15 @@ class AcpExecutor(Executor):
         error: _AcpJsonObject | None = None
         try:
             if method == _AGENT_REQUEST_REQUEST_PERMISSION:
+                if self._side_effect_observer is not None:
+                    self._side_effect_observer()
                 allow, option_id = await self._decide_permission(params)
                 result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
+                if self._side_effect_observer is not None:
+                    self._side_effect_observer()
                 result = await self._handle_fs_write(params)
             else:
                 error = {
@@ -1984,9 +1992,7 @@ class AcpExecutor(Executor):
             # A launcher exiting does not prove its detached descendants exited.
             _proc.kill_tree(proc)
 
-        deadline = (
-            asyncio.get_running_loop().time() + _FAILOVER_REAP_TIMEOUT_SECONDS
-        )
+        deadline = asyncio.get_running_loop().time() + _FAILOVER_REAP_TIMEOUT_SECONDS
         while _proc.process_identities_alive(tracked):
             if asyncio.get_running_loop().time() >= deadline:
                 raise RuntimeError("ACP process tree remained alive after forced termination")

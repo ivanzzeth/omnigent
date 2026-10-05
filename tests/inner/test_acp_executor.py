@@ -921,6 +921,34 @@ async def test_decide_permission_allows_with_no_gates() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("session/request_permission", {"toolCall": {"title": "shell"}}),
+        ("fs/write_text_file", {"path": "note.txt", "content": "changed"}),
+    ],
+)
+async def test_native_side_effect_requests_notify_failover_supervisor(
+    method: str, params: dict[str, object]
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    observed: list[str] = []
+    ex._side_effect_observer = lambda: observed.append(method)
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    if method == "fs/write_text_file":
+        ex._fs_delegation = True
+        environment = AsyncMock()
+        environment.write.return_value = {}
+        ex._ensure_os_environment = AsyncMock(return_value=environment)  # type: ignore[method-assign]
+
+    await ex._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    )
+
+    assert observed == [method]
+
+
+@pytest.mark.asyncio
 async def test_decide_permission_denies_on_policy_deny() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
 
