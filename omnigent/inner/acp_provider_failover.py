@@ -61,6 +61,12 @@ _DIRECT_RECOVERABLE_MARKERS = (
     "usage quota",
     "available accounts exhausted",
     "authentication failed",
+    # OpenAI-compatible gateways commonly omit the HTTP status from the ACP
+    # error and surface only one of these messages.  They are still
+    # credential-scoped provider failures: replaying on another provider can
+    # repair the turn, while retrying this provider cannot.
+    "incorrect api key",
+    "invalid api key",
 )
 _PROVIDER_ERROR_CODES = {
     "authentication_error",

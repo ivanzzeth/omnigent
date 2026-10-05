@@ -109,6 +109,12 @@ def test_plain_authorization_errors_are_not_assumed_to_be_provider_failures() ->
         ExecutorError(message="workspace operation forbidden", retryable=True)
     )
     assert not is_recoverable_provider_error(ExecutorError(message="unauthorized", retryable=True))
+    assert not is_recoverable_provider_error(
+        ExecutorError(
+            message="tool error: invalid api key argument passed to formatter",
+            retryable=True,
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -168,6 +174,31 @@ async def test_provider_auth_failure_switches_even_when_same_provider_is_not_ret
 
     assert events == [TurnComplete(response="ok")]
     assert "create:fallback" in lifecycle
+
+
+@pytest.mark.asyncio
+async def test_openai_incorrect_api_key_message_switches_before_output() -> None:
+    lifecycle: list[str] = []
+    auth_error = ExecutorError(
+        message=(
+            "Internal error: Incorrect API key provided: probe-in*****-key. "
+            "You can find your API key at https://platform.openai.com/account/api-keys."
+        ),
+        retryable=False,
+    )
+
+    events = await _collect(
+        _supervisor([[auth_error], [TurnComplete(response="fallback ok")]], lifecycle)
+    )
+
+    assert events == [TurnComplete(response="fallback ok")]
+    assert lifecycle == [
+        "create:primary",
+        "run:primary:same turn",
+        "close:primary",
+        "create:fallback",
+        "run:fallback:same turn",
+    ]
 
 
 @pytest.mark.asyncio
