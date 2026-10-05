@@ -12,6 +12,7 @@ path lives in ``tests/inner/test_acp_executor.py``.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,26 @@ def test_embedded_omnigent_mcp_flag_forwarded() -> None:
         )
     )
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
+def test_embedded_provider_attempts_reach_harness_without_credentials() -> None:
+    attempts = [
+        {"name": "provider-1", "env": {"LINGXIAO_MODEL_ATTEMPT": "0"}},
+        {"name": "provider-2", "env": {"LINGXIAO_MODEL_ATTEMPT": "1"}},
+    ]
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:opencode",
+            acp_agent={
+                "name": "OpenCode",
+                "command": "wrapper opencode",
+                "provider_attempts": attempts,
+            },
+        )
+    )
+
+    assert json.loads(env["HARNESS_ACP_PROVIDER_ATTEMPTS"]) == attempts
+    assert "api_key" not in env["HARNESS_ACP_PROVIDER_ATTEMPTS"]
 
 
 @pytest.mark.parametrize(
