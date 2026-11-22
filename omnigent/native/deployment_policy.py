@@ -34,14 +34,21 @@ def deployment_policy_from_spec(
     if spec is None:
         return None
     from omnigent.runner.native.orchestration import ResolvedSpec
+    from omnigent.spec.types import AgentSpec
 
     resolved = spec.spec if isinstance(spec, ResolvedSpec) else spec
-    raw = resolved.executor.config.get("native_deployment_policy")
+    config = getattr(resolved.executor, "config", {})
+    if not isinstance(config, dict) or (
+        isinstance(resolved, AgentSpec)
+        and not isinstance(getattr(resolved.executor, "config", None), dict)
+    ):
+        raise ValueError("invalid native executor config")
+    raw = config.get("native_deployment_policy")
     if raw is None:
         return None
     if (
-        type(resolved.executor.config.get("native_deployment_policy_version")) is not int
-        or resolved.executor.config["native_deployment_policy_version"] != 1
+        type(config.get("native_deployment_policy_version")) is not int
+        or config["native_deployment_policy_version"] != 1
     ):
         raise ValueError("native deployment policy version 1 is required")
     names = {item.name for item in fields(NativeDeploymentPolicy)}

@@ -114,6 +114,8 @@ class ToolManager:
         os_env: OSEnvironment | None = None,
         *,
         os_env_schema_only: bool = False,
+        skill_workspace: Path | None = None,
+        skill_bundle_dir: Path | None = None,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -143,9 +145,15 @@ class ToolManager:
         :param os_env_schema_only: Register static OS tool schemas without
             creating an environment. For metadata callers only; OS tool
             execution remains runner-owned. Preserves the ``os_env`` gate.
+        :param skill_workspace: Trusted current run repository/worktree root.
+            Missing roots never fall back to cwd for restricted deployments.
+        :param skill_bundle_dir: Verified extracted bundle root for metadata-only
+            callers; unlike ``workdir``, does not register/import local tools.
         """
         self._spec = spec
         self._workdir = workdir
+        self._skill_workspace = skill_workspace
+        self._skill_bundle_dir = skill_bundle_dir if skill_bundle_dir is not None else workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
         self._started = False
@@ -304,17 +312,32 @@ class ToolManager:
         at init time even when the agent has no bundled skills.
         Registers ``read_skill_file`` only when at least one skill
         has bundled resource files.
+        Restricted deployments instead share the explicit bundle/run source
+        context used by runner dispatch and the session menu.
         """
+        from omnigent.spec.skill_sources import deployment_skill_source_context
+
+        source_context = deployment_skill_source_context(
+            self._spec,
+            (self._skill_workspace,) if self._skill_workspace is not None else (),
+            self._skill_bundle_dir,
+        )
         load_tool = LoadSkillTool(
             self._spec.skills,
             agent_root=self._workdir,
             skills_filter=self._spec.skills_filter,
+            source_context=source_context,
         )
         self._tools[load_tool.name()] = load_tool
         # Combine bundled + discovered skills for resource check.
         all_skills = load_tool.skills
-        if any_skill_has_resources(all_skills):
-            read_tool = ReadSkillFileTool(all_skills)
+        if any_skill_has_resources(all_skills, contained=source_context is not None):
+            read_tool = ReadSkillFileTool(
+                all_skills,
+                allowed_roots=source_context.restricted_roots
+                if source_context is not None
+                else None,
+            )
             self._tools[read_tool.name()] = read_tool
 
     def _register_builtin_tools(self) -> None:

@@ -104,6 +104,8 @@ class SkillSourceContext:
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
         terminal-matching resolution (including config-home tiers)
         so it applies only to native harnesses, never the in-process SDK ones.
+    :param restricted_roots: Explicit run/bundle containment roots for deployments
+        excluding personal host skills. ``None`` preserves ambient discovery.
     """
 
     roots: tuple[Path, ...]
@@ -113,6 +115,30 @@ class SkillSourceContext:
     claude_config_dir: Path | None = None
     codex_home: Path | None = None
     is_native: bool = False
+    restricted_roots: tuple[Path, ...] | None = None
+
+
+def deployment_skill_source_context(
+    spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
+) -> SkillSourceContext | None:
+    """Use only explicit run/bundle roots for a deployment excluding host skills."""
+    from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+    if getattr(spec, "executor", None) is None:
+        return None
+    policy = deployment_policy_from_spec(spec)
+    if policy is None or policy.host_skills:
+        return None
+    allowed = tuple(root.resolve() for root in roots)
+    if bundle_dir is not None:
+        allowed += (bundle_dir.resolve(),)
+    return SkillSourceContext(
+        roots=roots,
+        home=Path("/"),
+        skills_filter=spec.skills_filter,
+        bundle_dir=bundle_dir,
+        restricted_roots=allowed,
+    )
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -260,6 +286,14 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     """
     from omnigent.harness_aliases import is_native_harness
 
+    if ctx.restricted_roots is not None:
+        return _dedup(
+            [
+                skill
+                for root in ctx.roots
+                for skill in discover_host_skills(root, ctx.skills_filter, boundary=root)
+            ]
+        )
     family = _harness_family(harness)
     provider = _SKILL_SOURCES.get(family, _generic_host_skills)
     # The terminal-matching resolution — a native session types ``/name`` into
@@ -276,6 +310,15 @@ def resolve_session_skills(
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
 
+    restricted = deployment_skill_source_context(spec, roots, bundle_dir)
+    if restricted is not None:
+        from omnigent.tools.builtins.load_skill import LoadSkillTool
+
+        return [
+            s
+            for s in LoadSkillTool(spec.skills, source_context=restricted).skills
+            if s.user_invocable
+        ]
     merged = [s for s in spec.skills if s.user_invocable]
     seen = {s.name for s in spec.skills}
     seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}

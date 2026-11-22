@@ -22,13 +22,16 @@ class ReadSkillFileTool(Tool):
         with bundled resource files are relevant).
     """
 
-    def __init__(self, skills: list[SkillSpec]) -> None:
+    def __init__(
+        self, skills: list[SkillSpec], *, allowed_roots: tuple[Path, ...] | None = None
+    ) -> None:
         """
         Initialize with the agent's skill list.
 
         :param skills: Parsed skills from the agent spec.
         """
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in skills}
+        self._allowed_roots = allowed_roots
 
     @classmethod
     def name(cls) -> str:
@@ -125,6 +128,10 @@ class ReadSkillFileTool(Tool):
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         if skill.skill_dir is None:
             return "Error: skill has no directory on disk (loaded from in-memory config)."
+        if self._allowed_roots is not None and not any(
+            skill.skill_dir.resolve().is_relative_to(root) for root in self._allowed_roots
+        ):
+            return "Error: skill directory is outside the deployment sources"
         return _read_file_safely(skill.skill_dir, rel_path)
 
 

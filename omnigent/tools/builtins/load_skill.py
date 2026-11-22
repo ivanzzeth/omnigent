@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+
+if TYPE_CHECKING:
+    from omnigent.spec.skill_sources import SkillSourceContext
 
 
 class LoadSkillTool(Tool):
@@ -26,6 +30,8 @@ class LoadSkillTool(Tool):
     :param skills_filter: The agent spec's ``skills_filter``
         value (``"all"``/``"none"``/list). Controls which
         host-scope skills are included.
+    :param source_context: Explicit deployment sources, when supplied. Missing
+        deployment roots do not fall back to cwd or personal directories.
     """
 
     def __init__(
@@ -33,6 +39,8 @@ class LoadSkillTool(Tool):
         skills: list[SkillSpec],
         agent_root: Path | None = None,
         skills_filter: str | list[str] = "all",
+        *,
+        source_context: SkillSourceContext | None = None,
     ) -> None:
         """
         Initialize with bundled + host-scope skills.
@@ -44,15 +52,30 @@ class LoadSkillTool(Tool):
             the agent spec.
         """
         all_skills = list(skills)
+        self._source_context = source_context
         from omnigent.spec.parser import discover_host_skills
 
-        try:
-            discovery_root = agent_root or Path.cwd()
-        except OSError:
-            # A runner can outlive its working directory; bundled skills still work.
-            host_skills = []
+        if source_context is not None:
+            from omnigent.spec.skill_sources import resolve_harness_skills
+
+            roots = source_context.restricted_roots or ()
+            # Content already parsed from StoredSpec stays available. Without a
+            # verified extraction root, never retain an arbitrary file handle.
+            all_skills = [
+                s
+                if s.skill_dir is None
+                or any(s.skill_dir.resolve().is_relative_to(root) for root in roots)
+                else replace(s, skill_dir=None)
+                for s in skills
+            ]
+            host_skills = resolve_harness_skills(source_context, None)
         else:
-            host_skills = discover_host_skills(discovery_root, skills_filter)
+            try:
+                discovery_root = agent_root or Path.cwd()
+            except OSError:
+                host_skills = []
+            else:
+                host_skills = discover_host_skills(discovery_root, skills_filter)
 
         bundled_names = {s.name for s in skills}
         for hs in host_skills:
@@ -140,11 +163,20 @@ class LoadSkillTool(Tool):
         if skill is None:
             available = list(self._skills_by_name.keys())
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
-        resources = list_skill_resources(skill)
+        if (
+            self._source_context is not None
+            and skill.skill_dir is not None
+            and not any(
+                skill.skill_dir.resolve().is_relative_to(root)
+                for root in (self._source_context.restricted_roots or ())
+            )
+        ):
+            return "Error: skill directory is outside the deployment sources"
+        resources = list_skill_resources(skill, contained=self._source_context is not None)
         return format_skill_content(skill, resources)
 
 
-def list_skill_resources(skill: SkillSpec) -> list[str]:
+def list_skill_resources(skill: SkillSpec, *, contained: bool = False) -> list[str]:
     """
     List resource files in a skill's directory.
 
@@ -163,14 +195,20 @@ def list_skill_resources(skill: SkillSpec) -> list[str]:
         return []
     files: list[str] = []
     for fp in sorted(skill.skill_dir.iterdir()):
+        if contained and not fp.resolve().is_relative_to(skill.skill_dir.resolve()):
+            continue
         # Dotfiles are editor/OS cruft, and SKILL.md is the skill itself.
         if fp.is_file() and fp.name != "SKILL.md" and not fp.name.startswith("."):
             files.append(fp.name)
     for subdir_name in ("references", "scripts", "assets"):
         subdir = skill.skill_dir / subdir_name
+        if contained and not subdir.resolve().is_relative_to(skill.skill_dir.resolve()):
+            continue
         if not subdir.is_dir():
             continue
         for fp in sorted(subdir.rglob("*")):
+            if contained and not fp.resolve().is_relative_to(skill.skill_dir.resolve()):
+                continue
             if fp.is_file():
                 rel = str(fp.relative_to(skill.skill_dir))
                 files.append(rel)

@@ -4718,9 +4718,19 @@ def create_runner_app(
             return
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.spec.skill_sources import deployment_skill_source_context
 
         relay_spec = _unwrap_spec_entry(spec_entry)
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        restricted_skills = (
+            relay_spec is not None
+            and deployment_skill_source_context(relay_spec, (), None) is not None
+        )
+        relay_workspace = await _session_workspace_value(session_id) if restricted_skills else None
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            relay_spec,
+            bundle_dir=_resolved_spec_workdir(spec_entry),
+            workspace=Path(relay_workspace) if relay_workspace is not None else runner_workspace,
+        )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -5192,6 +5202,7 @@ def create_runner_app(
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
+                    from omnigent.spec.skill_sources import deployment_skill_source_context
                     from omnigent.tools.manager import (
                         ToolManager,
                     )
@@ -5199,6 +5210,11 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        skill_workspace=(
+                            await _session_runtime_cwd(conv)
+                            if deployment_skill_source_context(cached_spec, (), None) is not None
+                            else None
+                        ),
                         os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
@@ -7253,7 +7269,10 @@ def create_runner_app(
             resolved = candidate.resolve()
             if resolved not in roots:
                 roots.append(resolved)
-        if not roots:
+        from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+        policy = deployment_policy_from_spec(spec)
+        if not roots and (policy is None or policy.host_skills):
             roots.append(Path.cwd())
 
         skills = await asyncio.to_thread(

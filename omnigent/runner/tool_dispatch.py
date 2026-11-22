@@ -534,7 +534,9 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None, *, bundle_dir: Path | None = None, workspace: Path | None = None
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -569,7 +571,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
     selected = (
-        _granted_tool_names(spec)
+        _granted_tool_names(spec, bundle_dir=bundle_dir, workspace=workspace)
         if spec is not None and deployment_policy_from_spec(spec) is not None
         else None
     )
@@ -595,7 +597,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
+        for schema in ToolManager(
+            spec, skill_bundle_dir=bundle_dir, skill_workspace=workspace, os_env_schema_only=True
+        ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
                 _append(function)
@@ -955,7 +959,7 @@ def should_dispatch_locally(tool_name: str) -> bool:
 # ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
 # guards against id reuse after the spec is garbage-collected.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, Path | None, Path | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -980,7 +984,13 @@ def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None
     return canonicalize_harness(raw) or raw
 
 
-def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
+def _granted_tool_names(
+    agent_spec: AgentSpec,
+    harness: str | None = None,
+    *,
+    bundle_dir: Path | None = None,
+    workspace: Path | None = None,
+) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
     Mirrors advertisement: the names ``ToolManager`` registers, spec-local
@@ -996,11 +1006,13 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness)
+    cache_key = (id(agent_spec), harness, bundle_dir, workspace)
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
-    manager = ToolManager(agent_spec, os_env_schema_only=True)
+    manager = ToolManager(
+        agent_spec, skill_bundle_dir=bundle_dir, skill_workspace=workspace, os_env_schema_only=True
+    )
     try:
         names = set(manager.get_tool_names())
     finally:
@@ -1021,6 +1033,9 @@ def _ungranted_tool_reason(
     tool_name: str,
     agent_spec: AgentSpec | None,
     effective_harness: str | None = None,
+    *,
+    bundle_dir: Path | None = None,
+    workspace: Path | None = None,
 ) -> str | None:
     """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
 
@@ -1041,7 +1056,10 @@ def _ungranted_tool_reason(
         return None
     try:
         granted = _granted_tool_names(
-            agent_spec, _effective_harness_name(agent_spec, effective_harness)
+            agent_spec,
+            _effective_harness_name(agent_spec, effective_harness),
+            bundle_dir=bundle_dir,
+            workspace=workspace,
         )
     except Exception as exc:
         _logger.exception("granted tool surface unavailable for %s", tool_name)
@@ -6730,7 +6748,15 @@ async def execute_tool(
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
     if mcp_manager is None:
-        refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
+        refusal = _ungranted_tool_reason(
+            tool_name,
+            agent_spec,
+            effective_harness,
+            workspace=runner_workspace,
+            bundle_dir=None
+            if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+            else cast(Path | None, local_tool_workdir),
+        )
         if refusal is not None:
             return json.dumps({"error": refusal})
     from omnigent.sandbox.copy_on_write import has_copy_on_write
@@ -6938,6 +6964,11 @@ async def execute_tool(
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                bundle_dir=(
+                    None
+                    if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+                    else cast(Path | None, local_tool_workdir)
+                ),
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -8575,7 +8606,15 @@ def _spawn_async_tool(
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
     if mcp_manager is None:
-        refusal = _ungranted_tool_reason(target_tool, agent_spec, effective_harness)
+        refusal = _ungranted_tool_reason(
+            target_tool,
+            agent_spec,
+            effective_harness,
+            workspace=runner_workspace,
+            bundle_dir=None
+            if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
+            else cast(Path | None, local_tool_workdir),
+        )
         if refusal is not None:
             return f"Error: sys_call_async refused: {refusal}"
 
@@ -9112,6 +9151,7 @@ def _execute_skill_tool(
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    bundle_dir: Path | None = None,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
@@ -9127,6 +9167,7 @@ def _execute_skill_tool(
         host-scope skill discovery.
     :returns: Tool output string.
     """
+    from omnigent.spec.skill_sources import deployment_skill_source_context
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -9136,16 +9177,31 @@ def _execute_skill_tool(
     # orchestration surface (tools.agents). This teaches the LLM how to
     # author valid agent configs via sys_os_write without requiring the
     # agent's own bundle to ship a skills/ directory.
-    bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
-
     # Both tools must resolve the same registry: a skill load_skill can load
     # from host scope must have its files readable too.
+    source_context = (
+        deployment_skill_source_context(
+            agent_spec, (runner_workspace,) if runner_workspace is not None else (), bundle_dir
+        )
+        if agent_spec is not None
+        else None
+    )
+    if source_context is None:
+        bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
     load_tool = LoadSkillTool(
         bundled_skills,
         agent_root=runner_workspace,
         skills_filter=skills_filter,
+        source_context=source_context,
     )
-    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
+    tool: Tool = (
+        load_tool
+        if tool_name == "load_skill"
+        else ReadSkillFileTool(
+            load_tool.skills,
+            allowed_roots=source_context.restricted_roots if source_context is not None else None,
+        )
+    )
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

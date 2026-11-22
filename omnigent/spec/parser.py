@@ -2424,14 +2424,15 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
 def discover_host_skills(
     agent_root: Path,
     skills_filter: str | list[str],
+    *,
+    boundary: Path | None = None,
 ) -> list[SkillSpec]:
     """
     Discover host-scope skills from ``.claude/skills/`` and
     ``.agents/skills/`` directories walking up from *agent_root*,
     plus the user's global ``~/.claude/skills/``.
 
-    Not called by :func:`parse` — host-scope skills are a REPL
-    concern, not a spec concern. Callers (e.g. ``chat.py``) merge
+    Not called by :func:`parse`. Callers (e.g. ``chat.py``) merge
     the result into ``spec.skills`` before passing to
     ``run_repl``.
 
@@ -2440,6 +2441,8 @@ def discover_host_skills(
         agent spec. ``"none"`` suppresses all host skills;
         ``"all"`` loads everything; a list of names loads only
         those.
+    :param boundary: Optional trusted repository root. Stops ancestor discovery
+        there, excludes user-global sources and rejects paths resolving outside it.
     :returns: Deduplicated list of :class:`SkillSpec` objects.
         Later directories (closer to /) lose on name collision
         with earlier ones (closer to agent_root).
@@ -2455,7 +2458,7 @@ def discover_host_skills(
         filter_names = set(skills_filter)
 
     def _scan_dir(d: Path) -> None:
-        for spec in _discover_skills(d, skipped=skipped):
+        for spec in _discover_skills(d, skipped=skipped, boundary=boundary):
             if spec.name in seen_names:
                 continue
             if filter_names is not None and not skill_matches_names(spec, filter_names):
@@ -2466,18 +2469,24 @@ def discover_host_skills(
     # Walk from agent_root up to filesystem root, scanning
     # .claude/skills/ and .agents/skills/ at each level.
     current = agent_root.resolve()
+    if boundary is not None:
+        boundary = boundary.resolve()
+        if not current.is_relative_to(boundary):
+            return []
     while True:
         for dotdir in (".claude", ".agents"):
             candidate = current / dotdir / "skills"
-            if candidate.is_dir():
+            if (
+                boundary is None or candidate.resolve().is_relative_to(boundary)
+            ) and candidate.is_dir():
                 _scan_dir(candidate)
         parent = current.parent
-        if parent == current:
+        if parent == current or current == boundary:
             break
         current = parent
 
     # Also scan user-global skill directories.
-    for dotdir in (".claude", ".agents"):
+    for dotdir in () if boundary is not None else (".claude", ".agents"):
         home_skills = Path.home() / dotdir / "skills"
         if home_skills.is_dir():
             _scan_dir(home_skills)
@@ -2509,6 +2518,7 @@ def _discover_skills(
     *,
     skipped: list[str] | None = None,
     _depth: int = 0,
+    boundary: Path | None = None,
 ) -> list[SkillSpec]:
     """
     Discover and parse all skills under the ``skills/`` directory.
@@ -2533,6 +2543,8 @@ def _discover_skills(
     :returns: Parsed :class:`SkillSpec` objects in deterministic path order.
         Returns an empty list if *skills_dir* does not exist.
     """
+    if boundary is not None and not skills_dir.resolve().is_relative_to(boundary.resolve()):
+        return []
     if not skills_dir.is_dir():
         return []
     try:
@@ -2548,13 +2560,21 @@ def _discover_skills(
         return []
     skills: list[SkillSpec] = []
     for skill_dir in entries:
+        if boundary is not None and not skill_dir.resolve().is_relative_to(boundary.resolve()):
+            continue
         if not skill_dir.is_dir() or skill_dir.name.startswith("."):
             continue
         skill_md = skill_dir / "SKILL.md"
+        if boundary is not None and not skill_md.resolve().is_relative_to(boundary.resolve()):
+            continue
         if not skill_md.exists():
             # Namespace folder: group skills one level deeper.
             if _depth < _SKILL_NAMESPACE_MAX_DEPTH:
-                skills.extend(_discover_skills(skill_dir, skipped=skipped, _depth=_depth + 1))
+                skills.extend(
+                    _discover_skills(
+                        skill_dir, skipped=skipped, _depth=_depth + 1, boundary=boundary
+                    )
+                )
             continue
         try:
             skill = _parse_skill(skill_md)

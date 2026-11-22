@@ -354,6 +354,8 @@ def get_builtin_tool(
 
 def any_skill_has_resources(
     skills: list[SkillSpec],
+    *,
+    contained: bool = False,
 ) -> bool:
     """
     Check whether any skill has bundled resource files.
@@ -364,4 +366,4 @@ def any_skill_has_resources(
         ``skill_dir`` with files beside SKILL.md, or in
         references/, scripts/, or assets/.
     """
-    return any(list_skill_resources(s) for s in skills)
+    return any(list_skill_resources(s, contained=contained) for s in skills)
