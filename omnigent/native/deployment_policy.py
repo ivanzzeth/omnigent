@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -54,6 +54,19 @@ def deployment_policy_from_spec(
     return NativeDeploymentPolicy(**raw)
 
 
+def _without_skill_runtime_locations(spec: AgentSpec) -> AgentSpec:
+    """Keep every declaration while excluding parser-derived extraction handles.
+
+    Skill/reference file identity remains owned by the immutable bundle digest;
+    this profile identity does not replace that resource-byte verification.
+    """
+    return replace(
+        spec,
+        skills=[replace(skill, skill_dir=None) for skill in spec.skills],
+        sub_agents=[_without_skill_runtime_locations(child) for child in spec.sub_agents],
+    )
+
+
 def deployment_spec_identity(spec: AgentSpec | ResolvedSpec | None) -> str:
     """Fingerprint the complete persisted spec, including explicit policy version.
 
@@ -67,6 +80,9 @@ def deployment_spec_identity(spec: AgentSpec | ResolvedSpec | None) -> str:
     resolved = spec.spec if isinstance(spec, ResolvedSpec) else spec
     return hashlib.sha256(
         json.dumps(
-            asdict(resolved), sort_keys=True, separators=(",", ":"), allow_nan=False
+            asdict(_without_skill_runtime_locations(resolved)),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         ).encode()
     ).hexdigest()

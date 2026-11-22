@@ -6543,3 +6543,71 @@ def test_native_deployment_profile_catalog_probe_only_legacy(tmp_path, monkeypat
             )
         )
     assert probe.call_count == (0 if restricted else 1)
+
+
+def test_native_deployment_identity_loaded_skill_bundle_ignores_extraction_directory(tmp_path):
+    from omnigent.cli import _bundle
+    from omnigent.native.deployment_policy import deployment_spec_identity
+    from omnigent.spec import load
+
+    source = tmp_path / "source"
+    skill = source / "skills" / "identity-fixture"
+    references = skill / "references"
+    references.mkdir(parents=True)
+    (source / "config.yaml").write_text(
+        json.dumps(
+            {
+                "spec_version": 1,
+                "name": "native-identity-fixture",
+                "skills": "all",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {
+                        "harness": "codex-native",
+                        "native_deployment_policy": {},
+                        "native_deployment_policy_version": 1,
+                    },
+                },
+            }
+        )
+    )
+    (skill / "SKILL.md").write_text(
+        "---\nname: identity-fixture\ndescription: Identity fixture.\n---\n"
+        "Read [reference](references/example.md).\n"
+    )
+    (references / "example.md").write_text("Immutable reference bytes.\n")
+    bundle = _bundle(source)
+    first = load(bundle, dest=tmp_path / "first", expand_env=False)
+    second = load(bundle, dest=tmp_path / "second", expand_env=False)
+    assert first.skills[0].skill_dir != second.skills[0].skill_dir
+    assert first.skills[0].content == second.skills[0].content
+    assert deployment_spec_identity(first) == deployment_spec_identity(second)
+    from dataclasses import replace
+
+    original = deployment_spec_identity(first)
+    assert original != deployment_spec_identity(replace(first, instructions="changed declaration"))
+    assert original != deployment_spec_identity(
+        replace(
+            first,
+            executor=replace(
+                first.executor, config={**first.executor.config, "harness": "opencode-native"}
+            ),
+        )
+    )
+    assert original != deployment_spec_identity(
+        replace(
+            first,
+            executor=replace(
+                first.executor,
+                config={
+                    **first.executor.config,
+                    "native_deployment_policy": {"trust_project": True},
+                },
+            ),
+        )
+    )
+    assert original != deployment_spec_identity(
+        replace(first, skills=[replace(first.skills[0], content="changed declared skill content")])
+    )
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        deployment_spec_identity(replace(first, params={"unknown_path": tmp_path}))
