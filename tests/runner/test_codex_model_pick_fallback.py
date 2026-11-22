@@ -109,8 +109,9 @@ async def codex_launch_harness(
         model: str | None,
         spec: AgentSpec | None = None,
         terminal_launch_args: Sequence[str] = (),
+        own_auth_only: bool = False,
     ) -> codex_app.NativeCodexLaunch:
-        del terminal_launch_args
+        del terminal_launch_args, own_auth_only
         return codex_app.NativeCodexLaunch(
             config_overrides=[],
             model=model or _PROVIDER_DEFAULT,
@@ -809,3 +810,65 @@ async def test_newer_pick_survives_reset_after_slow_fallback_launch(
     assert harness.snapshot["model_override"] == new_pick
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("relay_fails", [False, True])
+async def test_required_relay_is_prepared_before_codex_start(
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    resume: bool,
+    relay_fails: bool,
+) -> None:
+    """The original launcher must not expose a partial MCP catalog on startup."""
+    from dataclasses import asdict
+
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
+
+    harness = codex_launch_harness
+    harness.snapshot.clear()
+    if resume:
+        harness.snapshot["external_session_id"] = "00000000-0000-4000-8000-000000000001"
+        monkeypatch.setattr(
+            "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+        )
+    harness.agent_spec.executor.config.update(
+        {
+            "native_deployment_policy": asdict(NativeDeploymentPolicy()),
+            "native_deployment_policy_version": 1,
+        }
+    )
+
+    async def prepare(session_id: str, **kwargs: Any) -> None:
+        assert session_id == _SESSION_ID
+        assert kwargs["require_spec"] is True and kwargs["await_notify"] is False
+        assert kwargs["explicit_bridge_dir"].is_dir()
+        harness.events.append("relay-prepare")
+        if relay_fails:
+            raise ValueError("required native MCP schemas are unavailable")
+
+    launch = runner_native._auto_create_codex_terminal(
+        _SESSION_ID,
+        harness.registry,
+        lambda *_args: None,
+        agent_spec=harness.agent_spec,
+        server_client=harness.server_client,
+        ensure_comment_relay=prepare,
+    )
+    if relay_fails:
+        with pytest.raises(ValueError, match="required native MCP schemas"):
+            await launch
+        harness.app_server.start.assert_not_awaited()
+        harness.registry.launch_auxiliary_terminal.assert_not_awaited()
+    elif not resume:
+        await launch
+        assert harness.events.index("relay-prepare") < harness.events.index("app-server-start")
+        assert harness.events.count("relay-prepare") == 1
+    else:
+        # Stop after the original start boundary: resume client bootstrapping is
+        # covered by the existing resume scenarios, not duplicated here.
+        harness.app_server.start.side_effect = RuntimeError("after-relay-start-boundary")
+        with pytest.raises(RuntimeError, match="after-relay-start-boundary"):
+            await launch
+        assert harness.events == ["relay-prepare"]

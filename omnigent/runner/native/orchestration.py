@@ -131,6 +131,7 @@ class _EnsureCommentRelay(Protocol):
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        require_spec: bool = False,
     ) -> None:
         pass
 
@@ -5143,6 +5144,17 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    if deployment_policy is not None:
+        if ensure_comment_relay is None:
+            raise ValueError("required native MCP relay preparation is unavailable")
+        # Prepare the complete original relay before the app-server can perform
+        # its initial tools/list. This also fences same-thread/resume fast paths.
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+            require_spec=True,
+        )
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
@@ -5985,7 +5997,7 @@ async def _auto_create_codex_terminal(
     # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
     # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
     # rationale).
-    if ensure_comment_relay is not None:
+    if ensure_comment_relay is not None and deployment_policy is None:
         await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
 
     _logger.info(

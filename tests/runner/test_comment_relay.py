@@ -65,6 +65,10 @@ class _StubResourceRegistry:
     # _publish_tmux_target_for_bridge returns early when this is None.
     terminal_registry = None
 
+    async def get_terminal_resource(self, session_id: str, terminal_id: str) -> None:
+        """This non-spawning registry starts with no existing terminal."""
+        del session_id, terminal_id
+
     def __init__(self, tmp_path: Path) -> None:
         """
         Initialize the stub.
@@ -1648,3 +1652,102 @@ async def test_failed_launch_rolls_back_only_new_relay(
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
         shutil.rmtree(next_bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "schemas", "relay", "missing-spec"])
+async def test_required_native_relay_never_launches_with_partial_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    """Reuse the real runner relay closure; only the vendor launch is scripted."""
+    from dataclasses import asdict
+
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    launches: list[str] = []
+    entered: list[str] = []
+
+    class Gateway(_SwitchableServerClient):
+        async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            assert kwargs["json"]["method"] == "tools/list"
+            if failure == "schemas":
+                raise httpx.ConnectError("synthetic discovery unavailable")
+            return self._Response(
+                {
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "broker__fixture_read",
+                                "description": "Fixture only",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }
+                        ]
+                    }
+                }
+            )
+
+    async def launch(session_id: str, *args: Any, **kwargs: Any) -> SessionResourceView:
+        del args
+        entered.append(session_id)
+        await kwargs["ensure_comment_relay"](
+            session_id, explicit_bridge_dir=bridge_dir, await_notify=False, require_spec=True
+        )
+        launches.append(session_id)
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex fixture"
+        )
+
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={
+                "harness": "codex-native",
+                "native_deployment_policy": asdict(NativeDeploymentPolicy()),
+                "native_deployment_policy_version": 1,
+            },
+        ),
+        mcp_servers=[
+            MCPServerConfig(name="broker", transport="http", url="http://fixture.invalid")
+        ],
+    )
+    app = _switch_app(
+        tmp_path,
+        Gateway("bound"),
+        {} if failure == "missing-spec" else {"bound": ResolvedSpec(spec=spec, workdir=tmp_path)},
+    )
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch)
+    if failure == "relay":
+
+        def unavailable(*args: Any, **kwargs: Any) -> None:
+            raise OSError("synthetic relay unavailable")
+
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.bridge.start_tool_relay", unavailable
+        )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/resources/terminals",
+                json={"terminal": "codex", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert entered == ([] if failure == "missing-spec" else [session_id])
+            if failure is None:
+                assert response.status_code == 200, response.text
+                assert launches == [session_id]
+                assert "broker__fixture_read" in _relay_tool_names(bridge_dir / _TOOL_RELAY_FILE)
+            else:
+                # Missing StoredSpec is refused by the original context loader
+                # even before the relay/terminal adapter is entered.
+                assert response.status_code == (410 if failure == "missing-spec" else 500)
+                assert not launches
+                assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
+            await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

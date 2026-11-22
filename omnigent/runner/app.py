@@ -4649,6 +4649,7 @@ def create_runner_app(
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
+        require_spec: bool = False,
     ) -> None:
         import json as _json
 
@@ -4662,6 +4663,8 @@ def create_runner_app(
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
         except OmnigentError:
+            if require_spec:
+                raise ValueError("required native relay spec is unavailable") from None
             # Resolution failed; this is not the same as a session that
             # resolves to no spec. A relay already serving the session was
             # built from a real spec, so replacing it with the fallback
@@ -4693,7 +4696,12 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            not require_spec
+            and current is not None
+            and current.spec_entry is spec_entry
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -4711,7 +4719,8 @@ def create_runner_app(
         # installed a relay that already matches the current agent.
         current = _session_comment_relays.get(session_id)
         if (
-            current is not None
+            not require_spec
+            and current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
         ):
@@ -4721,6 +4730,11 @@ def create_runner_app(
         from omnigent.spec.skill_sources import deployment_skill_source_context
 
         relay_spec = _unwrap_spec_entry(spec_entry)
+        if require_spec:
+            from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+            if relay_spec is None or deployment_policy_from_spec(relay_spec) is None:
+                raise ValueError("required native relay spec is unavailable")
         restricted_skills = (
             relay_spec is not None
             and deployment_skill_source_context(relay_spec, (), None) is not None
@@ -4734,6 +4748,8 @@ def create_runner_app(
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
+            if require_spec and mcp.failures:
+                raise ValueError("required native MCP schemas are unavailable")
             relay_schemas.extend(mcp.schemas)
             for service, error in mcp.failures.items():
                 _logger.warning(
@@ -4744,7 +4760,8 @@ def create_runner_app(
                 )
             current = _session_comment_relays.get(session_id)
             if (
-                current is not None
+                not require_spec
+                and current is not None
                 and current.spec_entry is spec_entry
                 and current.bridge_dir == bridge_dir
             ):
@@ -4828,6 +4845,8 @@ def create_runner_app(
                     file_change_observer=_observe_native_file_changes,
                 )
         except (OSError, RuntimeError):
+            if require_spec:
+                raise ValueError("required native MCP relay is unavailable") from None
             _logger.warning(
                 "Failed to start comment relay for session=%s",
                 session_id,
