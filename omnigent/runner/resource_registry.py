@@ -479,6 +479,7 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
+        self._quiesced_native_sessions: set[str] = set()
         self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
@@ -778,6 +779,16 @@ class SessionResourceRegistry:
     def terminal_registry(self) -> TerminalRegistry | None:
         """The wrapped terminal registry."""
         return self._terminal_registry
+
+    def quiesce_native_session(self, session_id: str) -> None:
+        """Fence native launch/ensure under the caller's existing session lock."""
+        with self._lock:
+            self._quiesced_native_sessions.add(session_id)
+
+    def native_session_quiesced(self, session_id: str) -> bool:
+        """Read the sticky machine-run lifecycle fence; ordinary close never sets it."""
+        with self._lock:
+            return session_id in self._quiesced_native_sessions
 
     def terminal_resource_role(
         self,
@@ -1900,6 +1911,8 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        verify_native: bool = False,
     ) -> bool:
         """Close a terminal resource by id.
 
@@ -1933,12 +1946,33 @@ class SessionResourceRegistry:
                         ),
                     ),
                 )
+                role = self.terminal_resource_role(session_id, terminal_id)
+                if verify_native and role == CODEX_NATIVE_TERMINAL_ROLE:
+                    from omnigent.runner.native.orchestration import (
+                        teardown_codex_native_app_server,
+                    )
+
+                    # Close the owned pane first without dropping its registry slot.
+                    # A failed backend close remains reachable for exact retry.
+                    await entry.instance.close()
+                    if not entry.instance.native_runtime_close_verified:
+                        await teardown_codex_native_app_server(session_id, require_verified=True)
+                        entry.instance.native_runtime_close_verified = True
+                elif verify_native and role is not None and role.endswith("-native"):
+                    raise RuntimeError("Native backend verified closure is unavailable")
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=entry.instance,
                 )
-                if closed:
+                if (
+                    closed
+                    and self._terminal_registry.get(
+                        session_id, entry.terminal_name, entry.session_key
+                    )
+                    is None
+                ):
                     with self._lock:
                         self._terminal_roles.pop((session_id, terminal_id), None)
                         self._terminal_lifecycles.pop((session_id, terminal_id), None)

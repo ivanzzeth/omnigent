@@ -32,6 +32,7 @@ from omnigent.entities.session_resources import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.native.native_coding_agents import (
+    NATIVE_CODING_AGENTS,
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
@@ -861,14 +862,16 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource),
         )
 
-    @app.delete("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
-    async def delete_session_terminal(
-        session_id: str,
-        terminal_id: str,
+    async def _close_terminal_response(
+        session_id: str, terminal_id: str, *, quiesced: bool
     ) -> JSONResponse:
+        native_runtime = (
+            resource_registry.terminal_resource_role(session_id, terminal_id) == "codex-native"
+        )
         closed = await resource_registry.close_terminal(
             session_id,
             terminal_id,
+            verify_native=True,
         )
         if not closed:
             return JSONResponse(
@@ -886,8 +889,39 @@ def register_resource_routes(
                 "id": terminal_id,
                 "object": "session.resource.deleted",
                 "deleted": True,
+                "verified": True,
+                "native_runtime_verified": native_runtime,
+                "quiesced": quiesced,
             },
         )
+
+    @app.delete("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
+    async def delete_session_terminal(
+        session_id: str,
+        terminal_id: str,
+        quiesce: bool = False,
+    ) -> JSONResponse:
+        if not quiesce:
+            return await _close_terminal_response(session_id, terminal_id, quiesced=False)
+        # Resolve the original registry's exact id before acquiring its lock:
+        # an already in-flight ensure may not have published a terminal yet.
+        matches = [
+            agent
+            for agent in NATIVE_CODING_AGENTS
+            if terminal_resource_id(agent.terminal_name, "main") == terminal_id
+        ]
+        agent = matches[0] if len(matches) == 1 else None
+        locks = (
+            getattr(app.state, "native_terminal_ensure_locks", {}).get(agent.key)
+            if agent is not None
+            else None
+        )
+        if locks is None:
+            return JSONResponse(status_code=409, content={"error": {"code": "close_unverified"}})
+        lock = locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            resource_registry.quiesce_native_session(session_id)
+            return await _close_terminal_response(session_id, terminal_id, quiesced=True)
 
     async def _recreate_repl_terminal(
         session_id: str, terminal_id: str

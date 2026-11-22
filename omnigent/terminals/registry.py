@@ -593,27 +593,21 @@ class TerminalRegistry:
                 return False
             if expected is not None and slot.get(key) is not expected:
                 return False
-            instance = slot.pop(key, None)
-            if not slot:
-                # Drop the empty per-conversation dict so memory
-                # doesn't grow with stale conversation ids.
-                self._by_conversation.pop(conversation_id, None)
-            # Drop the per-instance lock too so subsequent
-            # ``get_instance_lock`` calls return ``None`` for this
-            # closed instance (callers surface a "not running"
-            # error to the LLM).
-            self._instance_locks.pop((conversation_id, terminal_name, session_key), None)
+            instance = slot.get(key)
         if instance is None:
             return False
-        try:
-            await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-        except TimeoutError:
-            logger.warning(
-                "Terminal close timed out for %s:%s in conv %s",
-                terminal_name,
-                session_key,
-                conversation_id,
-            )
+        # Keep the exact instance and its control lock until closure succeeds.
+        # Timeout/error must leave it reachable for an authenticated retry.
+        await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
+        with self._lock:
+            slot = self._by_conversation.get(conversation_id)
+            if slot is None or slot.get(key) is not instance:
+                return False
+            if slot.get(key) is instance:
+                slot.pop(key)
+                if not slot:
+                    self._by_conversation.pop(conversation_id, None)
+                self._instance_locks.pop((conversation_id, terminal_name, session_key), None)
         return True
 
     async def cleanup_conversation(self, conversation_id: str) -> None:

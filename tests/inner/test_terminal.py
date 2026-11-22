@@ -934,6 +934,12 @@ async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_pat
 
     instance._tmux = _tmux  # type: ignore[method-assign]
 
+    async def gone(*args: str) -> str:
+        raise terminal_mod._TmuxTargetGoneError(
+            list(args), returncode=1, stderr=b"no server running on socket"
+        )
+
+    instance._tmux_output = gone  # type: ignore[method-assign]
     await instance.close()
 
     assert commands == [("kill-server",)]
@@ -3620,3 +3626,29 @@ async def test_read_join_wrapped_asks_tmux_to_join_wrapped_rows(tmp_path: Path) 
     assert calls[1] == ("capture-pane", "-t", instance.tmux_target, "-p", "-J")
     assert plain["screen"] == joined["screen"]
     assert "https://signin.example.com/device?user_code=ABCDEFGH" in joined["screen"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["kill", "probe", "live"])
+async def test_close_failure_preserves_private_control(tmp_path: Path, failure: str) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    socket = private / "tmux.sock"
+    socket.touch()
+    instance = TerminalInstance("bash", "main", socket, private, running=True)
+
+    async def kill(*args: str) -> None:
+        if failure == "kill":
+            raise RuntimeError("synthetic kill failure")
+
+    async def probe(*args: str) -> str:
+        if failure == "probe":
+            raise RuntimeError("synthetic probe failure")
+        return "main: still alive"
+
+    instance._tmux = kill  # type: ignore[method-assign]
+    instance._tmux_output = probe  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await instance.close()
+    assert private.exists() and socket.exists()
+    assert instance.running

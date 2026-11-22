@@ -782,11 +782,9 @@ async def test_close_removes_instance_lock(tmp_path: Path) -> None:
     instance.close.assert_awaited_once()
 
 
-async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
+async def test_close_with_timeout_retains_control(tmp_path: Path) -> None:
     """
-    If ``instance.close()`` times out, ``close`` still returns ``True``
-    (the instance was found and removal from the registry succeeded).
-    The timeout is logged but does not propagate.
+    A timeout is not closure: propagate it and retain the exact slot for retry.
     """
     reg = TerminalRegistry()
     instance = TerminalInstance(
@@ -811,12 +809,13 @@ async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
     original = reg_mod._CLOSE_TIMEOUT_S
     reg_mod._CLOSE_TIMEOUT_S = 0.01
     try:
-        result = await reg.close("conv_a", "bash", "s1")
+        with pytest.raises(TimeoutError):
+            await reg.close("conv_a", "bash", "s1")
     finally:
         reg_mod._CLOSE_TIMEOUT_S = original
 
-    assert result is True
-    assert reg.get("conv_a", "bash", "s1") is None
+    assert reg.get("conv_a", "bash", "s1") is instance
+    assert reg.get_instance_lock("conv_a", "bash", "s1") is not None
 
 
 async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) -> None:
@@ -930,3 +929,49 @@ def test_multiple_terminals_per_conversation(tmp_path: Path) -> None:
 
     for (name, key), inst in instances.items():
         assert reg.get("conv_a", name, key) is inst
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_close_failure_keeps_exact_slot_and_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: bool
+) -> None:
+    class FailingTerminal(TerminalInstance):
+        async def close(self) -> None:
+            if timeout:
+                await asyncio.Event().wait()
+            raise RuntimeError("synthetic close failure")
+
+    instance = FailingTerminal("bash", "main", tmp_path / "tmux.sock", tmp_path)
+    registry = TerminalRegistry()
+    lock = threading.Lock()
+    registry._by_conversation["owned"] = {("bash", "main"): instance}
+    registry._instance_locks[("owned", "bash", "main")] = lock
+    monkeypatch.setattr(registry_mod, "_CLOSE_TIMEOUT_S", 0.01)
+    with pytest.raises((RuntimeError, TimeoutError)):
+        await registry.close("owned", "bash", "main")
+    assert registry.get("owned", "bash", "main") is instance
+    assert registry.get_instance_lock("owned", "bash", "main") is lock
+
+
+@pytest.mark.asyncio
+async def test_close_replacement_during_await_returns_false_and_keeps_successor(
+    tmp_path: Path,
+) -> None:
+    registry = TerminalRegistry()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class ClosingTerminal(TerminalInstance):
+        async def close(self) -> None:
+            entered.set()
+            await release.wait()
+
+    old = ClosingTerminal("bash", "main", tmp_path / "old.sock", tmp_path / "old")
+    new = TerminalInstance("bash", "main", tmp_path / "new.sock", tmp_path / "new")
+    registry._by_conversation["owned"] = {("bash", "main"): old}
+    task = asyncio.create_task(registry.close("owned", "bash", "main", expected=old))
+    await entered.wait()
+    registry._by_conversation["owned"][("bash", "main")] = new
+    release.set()
+    assert await task is False
+    assert registry.get("owned", "bash", "main") is new

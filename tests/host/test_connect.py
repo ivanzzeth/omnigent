@@ -9953,3 +9953,57 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "1965859176160743"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_handle_stop_unverified_exit_retains_owned_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    host = _make_host_process()
+
+    class AliveProcess:
+        def poll(self) -> None:
+            return None
+
+    process = AliveProcess()
+    handle = _RunnerHandle(proc=process, log_path=tmp_path / "runner.log")  # type: ignore[arg-type]
+    host._runners["owned-runner"] = handle
+
+    def incomplete_stop(proc: object) -> None:
+        if raises:
+            raise subprocess.TimeoutExpired("synthetic-owned-stop", 5)
+
+    monkeypatch.setattr(host, "_stop_runner_proc", incomplete_stop)
+    result = await host._handle_stop(
+        HostStopRunnerFrame(request_id="owned-stop", runner_id="owned-runner")
+    )
+    assert result.status == "failed"
+    assert "unverified" in (result.error or "")
+    assert host._runners["owned-runner"] is handle
+
+
+@pytest.mark.asyncio
+async def test_watch_runner_does_not_steal_stop_handler_owned_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = _make_host_process()
+    process = SimpleNamespace(returncode=0, poll=lambda: 0)
+    handle = _RunnerHandle(proc=process, log_path=tmp_path / "owned.log")  # type: ignore[arg-type]
+    host._runners["owned-stop-race"] = handle
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def stopping(proc: object, reason: str) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(host, "_stop_runner_and_trigger", stopping)
+    task = asyncio.create_task(
+        host._handle_stop(HostStopRunnerFrame(request_id="owned", runner_id="owned-stop-race"))
+    )
+    await entered.wait()
+    await host._watch_runner("owned-stop-race")
+    assert host._runners["owned-stop-race"] is handle
+    release.set()
+    assert (await task).status == "stopped"
+    assert "owned-stop-race" not in host._runners

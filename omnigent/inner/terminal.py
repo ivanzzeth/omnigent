@@ -1123,6 +1123,7 @@ class TerminalInstance:
     # longer reaps the server and cascades into ``no server running`` (#540).
     keep_alive_after_exit: bool = False
     running: bool = False
+    native_runtime_close_verified: bool = field(default=False, init=False, repr=False)
     launch_cwd: str | None = None
     # Runtime-owned observation; never part of the portable terminal spec.
     program_status_app: str | None = None
@@ -2017,8 +2018,15 @@ class TerminalInstance:
         # server (or a remain-on-exit pane), so cleanup must not trust that
         # advisory flag before issuing kill-server.
         if self.running or self.socket_path.exists():
-            with contextlib.suppress(RuntimeError):
+            # A missing server is idempotent; other failures retain control.
+            with contextlib.suppress(_TmuxTargetGoneError):
                 await self._tmux("kill-server")
+        try:
+            await self._tmux_output("list-sessions")
+        except _TmuxTargetGoneError:
+            pass
+        else:
+            raise RuntimeError("Terminal server closure is unverified")
         self.running = False
 
         if self._clipboard_bridge is not None:
@@ -2035,7 +2043,7 @@ class TerminalInstance:
 
         # Clean up the private dir (contains socket + fork).
         if self.private_dir.exists():
-            shutil.rmtree(self.private_dir, ignore_errors=True)
+            shutil.rmtree(self.private_dir)
 
     def start_idle_watcher(
         self,

@@ -10,6 +10,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -390,6 +391,9 @@ class _FakeTerminalRegistry:
 
 
 class _FakeResourceRegistry:
+    def native_session_quiesced(self, session_id: str) -> bool:
+        return False
+
     def __init__(self, terminal_registry: _FakeTerminalRegistry | None) -> None:
         self.terminal_registry = terminal_registry
 
@@ -669,14 +673,15 @@ async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
 
     seen_spec: dict[str, Any] = {}
     resolver_calls = {"n": 0}
+    resolved_spec = AgentSpec(spec_version=1)
 
     async def _fake_launch_pi(ctx: NativeLaunchContext) -> object:
         seen_spec["spec"] = ctx.agent_spec
         return object()
 
-    async def _resolver() -> str:
+    async def _resolver() -> AgentSpec:
         resolver_calls["n"] += 1
-        return "resolved-spec"
+        return resolved_spec
 
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
 
@@ -685,16 +690,16 @@ async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
         "pi-native", _launch_ctx(), ensure_locks={}, resolve_agent_spec=_resolver
     )
     assert resolver_calls["n"] == 1
-    assert seen_spec["spec"] == "resolved-spec"
+    assert seen_spec["spec"] is resolved_spec
 
-    # Existing terminal: resolver must NOT run.
+    # Existing terminals also resolve their original spec for policy validation.
     await _launch_native_terminal(
         "pi-native",
         _launch_ctx(resource_registry=_FakeResourceRegistry(_FakeTerminalRegistry(existing=True))),
         ensure_locks={},
         resolve_agent_spec=_resolver,
     )
-    assert resolver_calls["n"] == 1
+    assert resolver_calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -732,14 +737,14 @@ async def test_launch_native_terminal_build_context_enriches_only_on_create(
     assert build_calls["n"] == 1
     assert seen["bundle_dir"] == Path("/tmp/enriched")
 
-    # Existing terminal: build_context must NOT run.
+    # Existing terminal context is also required for original policy validation.
     await _launch_native_terminal(
         "pi-native",
         _launch_ctx(resource_registry=_FakeResourceRegistry(_FakeTerminalRegistry(existing=True))),
         ensure_locks={},
         build_context=_build,
     )
-    assert build_calls["n"] == 1
+    assert build_calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -778,6 +783,9 @@ class _FakeEnsureRegistry:
     """
 
     terminal_registry = None
+
+    def native_session_quiesced(self, session_id: str) -> bool:
+        return False
 
     def __init__(self, existing: SessionResourceView | None = None, close_ok: bool = True) -> None:
         self._existing = existing
@@ -2963,3 +2971,77 @@ def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
     assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
         "supervise_kimi_forwarder("
     )
+
+
+@pytest.mark.asyncio
+async def test_machine_quiesce_waits_for_inflight_ensure_and_fences_queued_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.native.orchestration import (
+        _ensure_native_terminal,
+        _launch_native_terminal,
+    )
+    from omnigent.terminals import TerminalRegistry
+
+    sid = "owned-machine-quiesce"
+    registry = TerminalRegistry()
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1), terminal_registry=registry)
+    resources = app.state.session_resource_registry
+    locks = app.state.native_terminal_ensure_locks["codex"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    instance = TerminalInstance(
+        "codex", "main", tmp_path / "tmux.sock", tmp_path / "private", running=True
+    )
+    instance.close = AsyncMock()  # type: ignore[method-assign]
+    instance.is_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    async def create(ctx: NativeLaunchContext) -> object:
+        entered.set()
+        await release.wait()
+        registry._by_conversation[sid] = {("codex", "main"): instance}
+        resources._terminal_roles[(sid, "terminal_codex_main")] = "codex-native"
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=sid, name="Codex"
+        )
+
+    process = SimpleNamespace(returncode=None)
+
+    async def close_backend() -> None:
+        process.returncode = 0
+
+    server = SimpleNamespace(proc=process, close=close_backend)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, sid, server)
+    monkeypatch.setattr("omnigent.runner.native._launch_codex", create)
+    ctx = NativeLaunchContext(
+        session_id=sid, resource_registry=resources, publish_event=lambda *args: None
+    )
+    async with _runner_client(app) as client:
+        ensure = asyncio.create_task(_ensure_native_terminal("codex", ctx, ensure_locks=locks))
+        await entered.wait()
+        deleting = asyncio.create_task(
+            client.delete(
+                f"/v1/sessions/{sid}/resources/terminals/terminal_codex_main?quiesce=true"
+            )
+        )
+        # Event-loop admission only; the held original ensure lock prevents close.
+        await asyncio.sleep(0)
+        assert not deleting.done()
+        queued = asyncio.create_task(
+            _launch_native_terminal("codex-native", ctx, ensure_locks=locks)
+        )
+        release.set()
+        await ensure
+        result = await deleting
+        assert result.status_code == 200
+        assert result.json()["verified"] and result.json()["quiesced"]
+        assert result.json()["native_runtime_verified"]
+        with pytest.raises(RuntimeError, match="quiesced"):
+            await queued
+        with pytest.raises(RuntimeError, match="quiesced"):
+            await _ensure_native_terminal("codex", ctx, ensure_locks=locks)
+    assert registry.get(sid, "codex", "main") is None
+    assert resources.terminal_resource_role(sid, "terminal_codex_main") is None

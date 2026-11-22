@@ -214,8 +214,12 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
-    if task is None or task.done():
+    task = _AUTO_FORWARDER_TASKS.get(session_id)
+    if task is None:
+        return
+    if task.done():
+        if session_id not in _AUTO_CODEX_APP_SERVERS:
+            _AUTO_FORWARDER_TASKS.pop(session_id, None)
         return
     task.cancel()
     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
@@ -226,9 +230,25 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
             session_id,
             _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
         )
+    elif (
+        session_id not in _AUTO_CODEX_APP_SERVERS and _AUTO_FORWARDER_TASKS.get(session_id) is task
+    ):
+        _AUTO_FORWARDER_TASKS.pop(session_id, None)
 
 
-async def teardown_codex_native_app_server(session_id: str) -> None:
+async def _close_codex_backend_verified(app_server: CodexNativeAppServer) -> None:
+    """Keep the original process handle until its exit is actually observed."""
+    process = app_server.proc
+    if process is None:
+        raise RuntimeError("Native backend process identity is unavailable")
+    await app_server.close()
+    if process.returncode is None:
+        raise RuntimeError("Native backend closure is unverified")
+
+
+async def teardown_codex_native_app_server(
+    session_id: str, *, require_verified: bool = False
+) -> None:
     """
     Tear down a host-spawned codex-native session's app-server subprocess.
 
@@ -248,20 +268,47 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     """
     app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
     bridge_dir = _AUTO_CODEX_BRIDGE_DIRS.get(session_id)
+    if require_verified:
+        task = _AUTO_FORWARDER_TASKS.get(session_id)
+        if app_server is None:
+            raise RuntimeError("Native backend process identity is unavailable")
+        process = app_server.proc
+        if process is None:
+            raise RuntimeError("Native backend process identity is unavailable")
+        await app_server.close()
+        if process.returncode is None:
+            raise RuntimeError("Native backend closure is unverified")
+        if task is not None and not task.done():
+            task.cancel()
+            _, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
+            if pending:
+                raise RuntimeError("Native forwarder closure is unverified")
+        if _AUTO_CODEX_APP_SERVERS.get(session_id) not in (None, app_server):
+            raise RuntimeError("Native backend identity changed during closure")
+        if _AUTO_FORWARDER_TASKS.get(session_id) not in (None, task):
+            raise RuntimeError("Native forwarder identity changed during closure")
+        _AUTO_FORWARDER_TASKS.pop(session_id, None)
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
+        return
     if app_server is None:
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
         return
     await _cancel_auto_forwarder_task(session_id)
-    registered_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
-    if registered_server is app_server:
+    try:
+        await _close_codex_backend_verified(app_server)
+    except Exception as exc:  # noqa: BLE001 - legacy shutdown remains best effort.
+        _logger.warning("Native backend cleanup unverified (%s)", type(exc).__name__)
+        return
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-    # Forwarder cleanup can retire its own backend; a newer launch can reuse its path.
-    if (registered_server is None or registered_server is app_server) and (
+    task = _AUTO_FORWARDER_TASKS.get(session_id)
+    if task is not None and task.done() and session_id not in _AUTO_CODEX_APP_SERVERS:
+        _AUTO_FORWARDER_TASKS.pop(session_id, None)
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is None and (
         _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
     ):
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
-    with contextlib.suppress(Exception):
-        await app_server.close()
 
 
 async def teardown_all_codex_native_app_servers() -> None:
@@ -328,7 +375,10 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 
     def _evict(done_task: asyncio.Task[object]) -> None:
         """Drop the registry entry unless a successor already replaced it; log the exit."""
-        if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
+        if (
+            _AUTO_FORWARDER_TASKS.get(session_id) is done_task
+            and session_id not in _AUTO_CODEX_APP_SERVERS
+        ):
             del _AUTO_FORWARDER_TASKS[session_id]
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
@@ -6572,7 +6622,7 @@ async def _codex_discover_thread_and_forward(
         # session teardown. ``supervise_forwarder`` also closes ``event_client``
         # in its own ``finally``; ``close()`` is idempotent. The app-server
         # subprocess is ours to stop, else it orphans one process per session.
-        # Pop first so the dict never holds a closed reference.
+        # Keep failed backend handles reachable for authenticated cleanup retry.
         _logger.info(
             "Codex native input stopped",
             extra=debug_event(
@@ -6584,15 +6634,20 @@ async def _codex_discover_thread_and_forward(
         )
         leftover_app_server = app_server
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
         with contextlib.suppress(Exception):
             await event_client.close()
         if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
+            try:
+                await _close_codex_backend_verified(leftover_app_server)
+            except Exception as exc:  # noqa: BLE001 - preserve failed resource control.
+                _logger.warning("Native backend cleanup unverified (%s)", type(exc).__name__)
+            else:
+                if _AUTO_CODEX_APP_SERVERS.get(session_id) is leftover_app_server:
+                    _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
 
@@ -6671,13 +6726,18 @@ async def _codex_forward_known_thread(
         )
         leftover_app_server = app_server
         if app_server is None or _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
-            leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            leftover_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
             if not cancelled:
                 # The pane outlives its app-server; mark it so the next ensure replaces it.
                 record_app_server_stopped(bridge_dir)
         if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
+            try:
+                await _close_codex_backend_verified(leftover_app_server)
+            except Exception as exc:  # noqa: BLE001 - preserve failed resource control.
+                _logger.warning("Native backend cleanup unverified (%s)", type(exc).__name__)
+            else:
+                if _AUTO_CODEX_APP_SERVERS.get(session_id) is leftover_app_server:
+                    _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _shutdown_session_router_async(session_id, subagent_router)
         await _shutdown_session_turn_router_async(session_id, turn_router)
 
@@ -10500,6 +10560,8 @@ async def _launch_native_terminal(
 
     lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
     async with lock:
+        if ctx.resource_registry.native_session_quiesced(ctx.session_id):
+            raise RuntimeError("Native session is quiesced")
         registry = ctx.resource_registry.terminal_registry
         has_terminal = (
             registry is not None
@@ -10664,6 +10726,8 @@ async def _ensure_native_terminal(
     terminal_id = terminal_resource_id(terminal_name, "main")
     lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
     async with lock:
+        if ctx.resource_registry.native_session_quiesced(ctx.session_id):
+            raise RuntimeError("Native session is quiesced")
         existing = await ctx.resource_registry.get_terminal_resource(ctx.session_id, terminal_id)
         if existing is not None:
             if is_owned is None or is_owned(ctx.resource_registry, existing):

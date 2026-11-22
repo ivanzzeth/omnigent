@@ -2311,7 +2311,7 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
-        handle = self._runners.pop(frame.runner_id, None)
+        handle = self._runners.get(frame.runner_id)
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
@@ -2323,7 +2323,23 @@ class HostProcess:
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
         # freeze the daemon's control handler.
-        await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
+        try:
+            await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
+            if await asyncio.to_thread(handle.proc.poll) is None:
+                raise RuntimeError("Runner exit is unverified")
+        except Exception as exc:  # noqa: BLE001 - retain exact handle for stop retry.
+            return HostStopRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"runner_stop_unverified:{type(exc).__name__}",
+            )
+        if self._runners.get(frame.runner_id) is not handle:
+            return HostStopRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="runner_identity_changed",
+            )
+        self._runners.pop(frame.runner_id, None)
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -2411,8 +2427,9 @@ class HostProcess:
             # exit (e.g. a zygote-forked runner whose zygote died and whose pid
             # probe is the only signal). The kill has been sent; give it a short
             # window, then move on.
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5.0)
+            proc.wait(timeout=5.0)
+        if proc.poll() is None:
+            raise RuntimeError("Runner exit is unverified")
 
     def _track_pending_runner_launch(
         self, runner_id: str, completion: asyncio.Future[None]
@@ -2503,6 +2520,9 @@ class HostProcess:
         # loop to avoid freezing the daemon on the enabled path.
         while await asyncio.to_thread(handle.proc.poll) is None:
             await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+        if handle.stop_requested:
+            # The exact stop handler owns successful removal and failed retries.
+            return
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.

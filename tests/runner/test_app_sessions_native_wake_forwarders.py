@@ -437,8 +437,12 @@ async def test_teardown_codex_native_app_server_cancels_forwarder_and_closes_ser
     class _FakeAppServer:
         closed = False
 
+        def __init__(self) -> None:
+            self.proc = SimpleNamespace(returncode=None)
+
         async def close(self) -> None:
             self.closed = True
+            self.proc.returncode = 0
 
     original_server = _FakeAppServer()
     replacement_server = _FakeAppServer()
@@ -1909,3 +1913,77 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_verified_teardown_preserves_failed_backend_control(
+    monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runner.native import orchestration
+
+    session_id = "owned-verified-close"
+    process = SimpleNamespace(returncode=None)
+
+    async def close() -> None:
+        if fails:
+            raise RuntimeError("synthetic backend close failure")
+        process.returncode = 0
+
+    server = SimpleNamespace(proc=process, close=close)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, session_id, server)
+    if fails:
+        with pytest.raises(RuntimeError):
+            await orchestration.teardown_codex_native_app_server(session_id, require_verified=True)
+        assert orchestration._AUTO_CODEX_APP_SERVERS[session_id] is server
+        assert process.returncode is None
+    else:
+        await orchestration.teardown_codex_native_app_server(session_id, require_verified=True)
+        assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+        assert process.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_teardown_missing_handle_is_unknown() -> None:
+    from omnigent.runner.native import orchestration
+
+    with pytest.raises(RuntimeError, match="identity is unavailable"):
+        await orchestration.teardown_codex_native_app_server(
+            "no-owned-backend", require_verified=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_backend_cleanup_retains_done_forwarder_for_exact_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    sid = "owned-failed-forwarder-close"
+    process = SimpleNamespace(returncode=None)
+    fail = True
+
+    async def close() -> None:
+        if fail:
+            raise RuntimeError("synthetic backend close failure")
+        process.returncode = 0
+
+    server = SimpleNamespace(proc=process, close=close)
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, sid, server)
+
+    async def finish() -> None:
+        with pytest.raises(RuntimeError):
+            await orchestration._close_codex_backend_verified(server)
+
+    task = asyncio.create_task(finish())
+    orchestration._register_auto_forwarder_task(sid, task)
+    await task
+    await asyncio.sleep(0)
+    assert orchestration._AUTO_FORWARDER_TASKS[sid] is task
+    assert orchestration._AUTO_CODEX_APP_SERVERS[sid] is server
+    fail = False
+    await orchestration.teardown_codex_native_app_server(sid, require_verified=True)
+    assert sid not in orchestration._AUTO_CODEX_APP_SERVERS
+    assert sid not in orchestration._AUTO_FORWARDER_TASKS
