@@ -969,6 +969,7 @@ def populate_codex_skills_from_bundle(
     *,
     copy_skills: bool = False,
     source_codex_home: Path | None = None,
+    include_host_skills: bool = True,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
@@ -989,6 +990,8 @@ def populate_codex_skills_from_bundle(
         first (highest-priority) source when present.
     :param skills_filter: The spec's ``skills_filter``: ``"all"`` /
         ``"none"`` / a list of skill names.
+    :param include_host_skills: Include operator host skills as additional sources.
+        False limits delivery to the immutable agent bundle using the same selector.
     :param copy_skills: Copy skill directories instead of symlinking them
         (see :func:`_populate_codex_skills`). Per-conversation temp homes
         pass ``True`` so the sandbox-exposed ``skills/`` subtree is
@@ -1000,7 +1003,20 @@ def populate_codex_skills_from_bundle(
         loads; the wrapped executor omits it and keeps ``~/.codex``.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
+    skill_sources = (
+        codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
+        if include_host_skills
+        else ([bundle_dir / "skills"] if bundle_dir is not None else [])
+    )
+    if not include_host_skills:
+        selected = select_codex_skill_dirs(skills_filter, skill_sources)
+        target = codex_home / "skills"
+        if target.is_symlink():
+            raise ValueError("restricted native skills root cannot be a link")
+        for entry in target.iterdir() if target.exists() else ():
+            source = selected.get(entry.name)
+            if source is None or not entry.is_symlink() or entry.resolve() != source.resolve():
+                raise ValueError("existing native skill is not from the persisted bundle")
     _populate_codex_skills(
         codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
     )
@@ -1120,6 +1136,7 @@ def _populate_codex_home_config(
     extend_model_catalog: bool = False,
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
+    include_personal_state: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
 ) -> None:
     """
@@ -1150,6 +1167,8 @@ def _populate_codex_home_config(
     - ``memories/`` and ``rules/`` are **symlinked** so file-based memories
       and user-defined rules are visible in each session.
 
+    :param include_personal_state: Also bridge operator memories, instructions and
+        hooks. False preserves the original credential refresh links only.
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
     :param source_dir: The primary ``CODEX_HOME`` directory
@@ -1200,7 +1219,28 @@ def _populate_codex_home_config(
             for name in symlink_files
             if name not in {"auth.json", ".credentials.json", "memories_1.sqlite"}
         )
-    if not minimal_config:
+    if not include_personal_state:
+        # The subscription refresh link is necessary; personal provider/login
+        # databases and memories are not part of this deployment profile.
+        symlink_files = tuple(name for name in symlink_files if name == "auth.json")
+        forbidden = (
+            *_CODEX_HOME_GLOBAL_INSTRUCTION_FILES,
+            "memories_1.sqlite",
+            ".credentials.json",
+            "config.toml",
+            "memories",
+            "rules",
+            "mcp-oauth-locks",
+            "plugins",
+            ".omnigent-config-profile.toml",
+        )
+        if any(
+            (target_dir / name).exists() or (target_dir / name).is_symlink() for name in forbidden
+        ):
+            raise ValueError(
+                "existing private Codex profile is not compatible with restricted deployment"
+            )
+    if not minimal_config and include_personal_state:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
     if inject_hooks:
         # The generated hooks file owns this path — a symlink to the user's
@@ -1214,6 +1254,9 @@ def _populate_codex_home_config(
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
+        if not include_personal_state and (link_path.exists() or link_path.is_symlink()):
+            if not link_path.is_symlink() or link_path.resolve() != source_file.resolve():
+                raise ValueError("restricted native login source changed")
         if link_path.exists() or link_path.is_symlink():
             continue
         try:
@@ -1232,7 +1275,7 @@ def _populate_codex_home_config(
         if filename in _CODEX_HOME_HARDLINK_FILES:
             (target_dir / _CODEX_HOME_SOURCE_RECORD).write_text(f"{source_dir.resolve()}\n")
 
-    if not minimal_config:
+    if not minimal_config and include_personal_state:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
             source_subdir = source_dir / reldir
             if not source_subdir.is_dir():
@@ -1255,7 +1298,7 @@ def _populate_codex_home_config(
                 )
 
     for filename in _CODEX_HOME_COPY_FILES:
-        if not include_credentials and filename == "config.toml":
+        if (not include_credentials or not include_personal_state) and filename == "config.toml":
             # A host config may contain static provider credentials or auth
             # commands. Signer-backed sessions rebuild their selected provider
             # below from trusted generated overrides instead of copying it.

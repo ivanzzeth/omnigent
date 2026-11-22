@@ -109,6 +109,7 @@ class NativeHarnessProvider:
     bridge_id_label_key: str | None = None
     interrupt_handler: str | None = None
     stop_handler: str | None = None
+    validate_deployment_policy: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
     bridge_dir: str | None = None  # cost-popup bridge-dir lookup
 
@@ -301,6 +302,11 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
         ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
         input_ready_probe=f"{pkg}.bridge:native_input_ready",
+        validate_deployment_policy=(
+            "omnigent.runner.native.orchestration:_validate_codex_deployment_policy"
+            if key == "codex"
+            else None
+        ),
     )
 
 
@@ -969,6 +975,11 @@ def _community_paths(contribution: HarnessContribution) -> list[str]:
     paths: list[str] = []
     paths.extend(contribution.harness_modules.values())
     paths.extend(contribution.spawn_env_builders.values())
+    paths.extend(
+        provider.validate_deployment_policy
+        for provider in contribution.native_providers
+        if provider.validate_deployment_policy is not None
+    )
     paths.extend(spec.generator for spec in contribution.background_title_generators.values())
     return paths
 

@@ -23,7 +23,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypedDict
 
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -4828,6 +4829,7 @@ async def _launch_codex_native_tui(
     from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
+    deployment_policy = getattr(app_server, "deployment_policy", None)
     codex_ws_url = app_server.listen_url
     assert codex_ws_url is not None
     workspace = str(launch_config.workspace)
@@ -4846,8 +4848,11 @@ async def _launch_codex_native_tui(
         # The runner provisions and trusts these hooks. An unknown CLI version
         # must not strand a headless session behind an interactive trust prompt.
         bypass_hook_trust=(
-            app_server.codex_cli_version is None
-            or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+            (deployment_policy is None or deployment_policy.trust_hooks)
+            and (
+                app_server.codex_cli_version is None
+                or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+            )
         ),
     )
     # Apply configured wrappers to both cold start and recovery.
@@ -4858,7 +4863,11 @@ async def _launch_codex_native_tui(
     )
 
     # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
+    _codex_harness_cfg = (
+        {}
+        if deployment_policy is not None and not deployment_policy.allow_project_config
+        else load_effective_config(workspace=workspace)
+    )
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
@@ -4933,6 +4942,7 @@ async def _launch_codex_native_tui(
             command=codex_command,
             args=codex_launch_args,
             env=codex_terminal_env(app_server),
+            inherit_env=deployment_policy is None,
             # Match the local ``omnigent codex`` terminal scrollback.
             scrollback=100_000,
             # Preserve the final frame and exit status until lifecycle cleanup.
@@ -4996,6 +5006,27 @@ async def _launch_codex_native_tui(
 #: Waits between ``thread/resume`` retries when codex finds no rollout for a
 #: thread whose rollout the runner just wrote.
 _CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0, 2.0)
+
+
+class _CodexDeploymentKwargs(TypedDict, total=False):
+    deployment_policy: NativeDeploymentPolicy
+    deployment_spec_sha256: str
+
+
+def _validate_codex_deployment_policy(policy, *, ctx, existing: bool = False) -> None:
+    """Validate the original Codex provider's implemented deployment inputs."""
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy, deployment_spec_identity
+
+    running = _AUTO_CODEX_APP_SERVERS.get(ctx.session_id)
+    if policy is None:
+        if running is not None and running.deployment_policy is not None:
+            raise ValueError("restricted native terminal requires its persisted spec")
+        return
+    if policy != NativeDeploymentPolicy():
+        raise ValueError("Codex provider does not implement this deployment policy combination")
+    identity = deployment_spec_identity(ctx.agent_spec)
+    if existing and (running is None or running.deployment_spec_sha256 != identity):
+        raise ValueError("existing native terminal deployment identity is missing or different")
 
 
 async def _auto_create_codex_terminal(
@@ -5086,12 +5117,27 @@ async def _auto_create_codex_terminal(
         write_bridge_state,
     )
     from omnigent.inner.codex_executor import codex_extended_catalog_env
+    from omnigent.native.deployment_policy import (
+        deployment_policy_from_spec,
+        deployment_spec_identity,
+    )
 
+    deployment_policy = deployment_policy_from_spec(agent_spec)
     launch_config = await _codex_native_launch_config(
         session_id=session_id,
         server_client=server_client,
         session_init=session_init,
     )
+    if deployment_policy is not None:
+        from omnigent.harnesses.codex_native.app_server import validate_codex_deployment_args
+
+        validate_codex_deployment_args(launch_config.terminal_launch_args or ())
+    if (
+        deployment_policy is not None
+        and launch_config.bypass_sandbox
+        and not deployment_policy.allow_bypass
+    ):
+        raise ValueError("native deployment policy forbids sandbox bypass")
     original_external_session_id = launch_config.external_session_id
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(launch_config.bridge_id or session_id)
@@ -5147,33 +5193,50 @@ async def _auto_create_codex_terminal(
         model=default_model,
         spec=_launch_spec,
         terminal_launch_args=_codex_terminal_args,
+        **(
+            {"own_auth_only": deployment_policy.own_auth_only}
+            if deployment_policy is not None
+            else {}
+        ),
     )
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
-    codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
+    codex_binding = (
+        binding_for_harness(load_runtime_inference_config(), "codex-native")
+        if deployment_policy is None
+        else None
+    )
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
     _catalog_launch = None
     _fresh_codex_catalog: list[_JsonObject] | None = None
-    try:
-        _catalog_launch = await asyncio.to_thread(
-            resolve_native_codex_launch,
-            model=None,
-            spec=_launch_spec,
-            terminal_launch_args=_codex_terminal_args,
-        )
-        _fresh_codex_catalog = fresh_codex_launch_catalog(
-            codex_path=_codex_cli_path,
-            launch=_catalog_launch,
-        )
-    except Exception:  # startup falls back to codex's migration probe
-        _logger.debug(
-            "fresh codex launch catalog unavailable for session=%s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
+    # The optional host-global probe has no deployment policy input. Required
+    # deployments use the bound app-server's native account default instead.
+    if deployment_policy is None:
+        try:
+            _catalog_launch = await asyncio.to_thread(
+                resolve_native_codex_launch,
+                model=None,
+                spec=_launch_spec,
+                terminal_launch_args=_codex_terminal_args,
+                **(
+                    {"own_auth_only": deployment_policy.own_auth_only}
+                    if deployment_policy is not None
+                    else {}
+                ),
+            )
+            _fresh_codex_catalog = fresh_codex_launch_catalog(
+                codex_path=_codex_cli_path,
+                launch=_catalog_launch,
+            )
+        except Exception:  # startup falls back to codex's migration probe
+            _logger.debug(
+                "fresh codex launch catalog unavailable for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     pick_to_reset: str | None = None
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
@@ -5181,9 +5244,13 @@ async def _auto_create_codex_terminal(
     # the user's shared config can never govern a session (the stale-gpt-5.4
     # 400 class). Profile-backed shapes already resolve their default at
     # materialization time and are left alone.
-    if codex_binding is None and (
-        launch_config.model_override
-        or (_codex_launch.model is None and _codex_launch.profile is None)
+    if (
+        deployment_policy is None
+        and codex_binding is None
+        and (
+            launch_config.model_override
+            or (_codex_launch.model is None and _codex_launch.profile is None)
+        )
     ):
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
@@ -5202,6 +5269,11 @@ async def _auto_create_codex_terminal(
                     model=None,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
+                    **(
+                        {"own_auth_only": deployment_policy.own_auth_only}
+                        if deployment_policy is not None
+                        else {}
+                    ),
                 )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
@@ -5247,6 +5319,11 @@ async def _auto_create_codex_terminal(
                     model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
+                    **(
+                        {"own_auth_only": deployment_policy.own_auth_only}
+                        if deployment_policy is not None
+                        else {}
+                    ),
                 )
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (
@@ -5520,6 +5597,11 @@ async def _auto_create_codex_terminal(
             bundle_dir,
             skills_filter,
             source_codex_home=_codex_home_config_source_from_env(),
+            **(
+                {"include_host_skills": deployment_policy.host_skills}
+                if deployment_policy is not None
+                else {}
+            ),
         )
     except OSError:
         _logger.warning(
@@ -5593,6 +5675,12 @@ async def _auto_create_codex_terminal(
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
+    deployment_kwargs: _CodexDeploymentKwargs = {}
+    if deployment_policy is not None:
+        deployment_kwargs = {
+            "deployment_policy": deployment_policy,
+            "deployment_spec_sha256": deployment_spec_identity(agent_spec),
+        }
     app_server = await asyncio.to_thread(
         build_codex_native_server,
         session_id=session_id,
@@ -5613,13 +5701,14 @@ async def _auto_create_codex_terminal(
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
-        trust_project=True,
+        trust_project=deployment_policy.trust_project if deployment_policy is not None else True,
         # Codex ignores --dangerously-bypass-hook-trust for the startup
         # hook-review screen on a persistent ``resume`` attach, which strands a
         # resumed web session behind the interactive "Hooks need review" prompt.
         # Persist trust for every merged hook so the review finds nothing to
         # review. See trust_all_codex_hooks.
-        trust_all_hooks=True,
+        trust_all_hooks=deployment_policy.trust_hooks if deployment_policy is not None else True,
+        **deployment_kwargs,
         # The host-global background janitor reconciles crash-leftover
         # app-servers. A targeted same-session reap remains synchronous only
         # for the resume path where an old writer can block correctness.
@@ -10410,6 +10499,20 @@ async def _launch_native_terminal(
                 await registry.cleanup_conversation(ctx.session_id)
             has_terminal = False
         if has_terminal:
+            if build_context is not None:
+                ctx = await build_context(ctx)
+            elif resolve_agent_spec is not None:
+                ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+            deployment_policy = deployment_policy_from_spec(ctx.agent_spec)
+            validate_policy = resolve_hook(provider, "validate_deployment_policy")
+            if deployment_policy is not None and validate_policy is None:
+                raise RuntimeError(
+                    "native provider has not implemented the requested deployment policy"
+                )
+            if validate_policy is not None:
+                validate_policy(deployment_policy, ctx=ctx, existing=True)
             return True
         if decision.skip or not decision.needs_terminal:
             return False
@@ -10423,6 +10526,16 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+            deployment_policy = deployment_policy_from_spec(ctx.agent_spec)
+            if deployment_policy is not None:
+                validate_policy = resolve_hook(provider, "validate_deployment_policy")
+                if validate_policy is None:
+                    raise RuntimeError(
+                        "native provider has not implemented the requested deployment policy"
+                    )
+                validate_policy(deployment_policy, ctx=ctx)
             _logger.info(
                 "Native input startup",
                 extra=debug_event(

@@ -28,6 +28,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.native.deployment_policy import NativeDeploymentPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1995,6 +1996,86 @@ def _build_native_codex_app_server_argv(
     return argv
 
 
+def _prepare_deployment_profile(home: Path, identity: str) -> None:
+    """Reject unknown profiles; regenerate only previously verified owned config.
+
+    The session's original StoredSpec/request hash remains the input authority.
+    This sidecar prevents a cold resume from mixing that spec with another
+    session's private config. It never grants tools or trusts project hooks.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise ValueError("restricted native deployment has no persisted spec identity")
+    if home.is_symlink():
+        raise ValueError("restricted deployment profile cannot be a link")
+    forbidden = (
+        "AGENTS.md",
+        "AGENTS.override.md",
+        "memories_1.sqlite",
+        ".credentials.json",
+        "memories",
+        "rules",
+        "mcp-oauth-locks",
+        "plugins",
+        ".omnigent-config-profile.toml",
+    )
+    if any((home / name).exists() or (home / name).is_symlink() for name in forbidden):
+        raise ValueError("restricted deployment profile contains personal state")
+    marker = home / ".omnigent-deployment.json"
+    config_files = ("config.toml", "hooks.json")
+    if marker.exists() or marker.is_symlink():
+        if marker.is_symlink() or not marker.is_file():
+            raise ValueError("invalid deployment profile identity file")
+        try:
+            prior = json.loads(marker.read_text())
+        except (ValueError, OSError) as exc:
+            raise ValueError("unreadable deployment profile identity") from exc
+        if (
+            not isinstance(prior, dict)
+            or set(prior) != {"version", "spec_sha256", "files"}
+            or type(prior.get("version")) is not int
+            or prior.get("version") != 1
+            or prior.get("spec_sha256") != identity
+        ):
+            raise ValueError("native deployment profile identity mismatch")
+        recorded = prior.get("files")
+        if not isinstance(recorded, dict) or set(recorded) != set(config_files):
+            raise ValueError("incomplete native deployment profile")
+        # Validate the entire fixed set before removing any generated file.
+        for name in config_files:
+            file = home / name
+            if (
+                file.is_symlink()
+                or not file.is_file()
+                or hashlib.sha256(file.read_bytes()).hexdigest() != recorded[name]
+            ):
+                raise ValueError("native deployment generated config changed")
+        for name in config_files:
+            (home / name).unlink()
+    elif any((home / name).exists() or (home / name).is_symlink() for name in config_files):
+        raise ValueError("unknown private native deployment profile")
+
+
+def _record_deployment_profile(home: Path, identity: str) -> None:
+    """Record only the original generated config after policy readiness."""
+    for name in ("config.toml", "hooks.json"):
+        if (home / name).is_symlink() or not (home / name).is_file():
+            raise ValueError("native deployment generated config is not a regular file")
+    files = {
+        name: hashlib.sha256((home / name).read_bytes()).hexdigest()
+        for name in ("config.toml", "hooks.json")
+    }
+    fd, temporary = tempfile.mkstemp(prefix=".omnigent-deployment.", dir=home)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(
+                {"version": 1, "spec_sha256": identity, "files": files}, output, sort_keys=True
+            )
+        os.replace(temporary, home / ".omnigent-deployment.json")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 @dataclass
 class CodexNativeAppServer:
     """
@@ -2091,6 +2172,8 @@ class CodexNativeAppServer:
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
+    deployment_policy: NativeDeploymentPolicy | None = None
+    deployment_spec_sha256: str | None = None
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
@@ -2171,6 +2254,10 @@ class CodexNativeAppServer:
             )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
+        if self.deployment_policy is not None:
+            if self.deployment_spec_sha256 is None:
+                raise ValueError("restricted native deployment requires the persisted spec")
+            _prepare_deployment_profile(self.codex_home, self.deployment_spec_sha256)
         # A previous launch's certificate record must not fail this launch's turns.
         clear_certificate_failure(self.bridge_dir)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -2208,7 +2295,7 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        minimal_config = codex_minimal_config_requested()
+        minimal_config = codex_minimal_config_requested() or self.deployment_policy is not None
         mcp_servers = read_codex_mcp_servers(
             config_source,
             self.config_profile,
@@ -2242,13 +2329,20 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
+            include_personal_state=(
+                self.deployment_policy is None or self.deployment_policy.personal_state
+            ),
         )
-        compose_profile_instructions = _materialize_codex_profile_for_start(
-            self.codex_home,
-            config_source,
-            self.config_profile,
-            codex_version=codex_version,
-            agent_instructions=self.developer_instructions,
+        compose_profile_instructions = (
+            False
+            if self.deployment_policy is not None
+            else _materialize_codex_profile_for_start(
+                self.codex_home,
+                config_source,
+                self.config_profile,
+                codex_version=codex_version,
+                agent_instructions=self.developer_instructions,
+            )
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
@@ -2285,6 +2379,10 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
+        if self.deployment_policy is not None and (
+            not policy_hooks_supported or not self.ap_server_url
+        ):
+            raise ValueError("restricted deployment requires the original native policy hook")
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -2304,7 +2402,11 @@ class CodexNativeAppServer:
                 self.python_executable,
                 router_bridge_dir=router_bridge_dir,
                 router_session_id=codex_router_session_id(self.env),
-                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+                user_hooks_source=(
+                    config_source / _CODEX_HOOKS_FILE
+                    if self.deployment_policy is None or self.deployment_policy.personal_state
+                    else None
+                ),
                 # The runner only advertises a route-turn endpoint for a
                 # session that launched with Smart Routing on, so its presence
                 # is the switch for the first-message routing hook. Same
@@ -2418,13 +2520,21 @@ class CodexNativeAppServer:
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
-                    except Exception as exc:  # noqa: BLE001 - degrade, never block startup
+                    except Exception as exc:  # Legacy deployments retain their behavior.
+                        if self.deployment_policy is not None:
+                            raise RuntimeError(
+                                "restricted native policy hook could not be trusted"
+                            ) from exc
                         self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
             finally:
                 try:
                     await startup_client.close()
                 except Exception:  # a dead control socket cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
+            if self.deployment_policy is not None:
+                if self.deployment_spec_sha256 is None:
+                    raise ValueError("restricted native deployment requires the persisted spec")
+                _record_deployment_profile(self.codex_home, self.deployment_spec_sha256)
         except BaseException as exc:
             if isinstance(exc, Exception):
                 self._log_startup_failure_snapshot(exc)
@@ -3542,6 +3652,20 @@ def _resolve_databricks_codex_model(
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 
+def validate_codex_deployment_args(args: Sequence[str]) -> None:
+    """Reject overrides outside this provider's restricted launch contract."""
+    canonical = canonical_codex_launch_args(args)
+    index = 0
+    while index < len(canonical):
+        pair = canonical[index : index + 2]
+        if len(pair) != 2 or not (
+            (pair[0] in {"-s", "--sandbox"} and pair[1] == "workspace-write")
+            or (pair[0] in {"-a", "--ask-for-approval"} and pair[1] == "on-request")
+        ):
+            raise ValueError("unsupported arguments for restricted native deployment")
+        index += 2
+
+
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -3558,6 +3682,8 @@ def build_codex_native_server(
     extra_config_overrides: list[str] | None = None,
     developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
+    deployment_policy: NativeDeploymentPolicy | None = None,
+    deployment_spec_sha256: str | None = None,
     trust_project: bool = False,
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
@@ -3629,6 +3755,12 @@ def build_codex_native_server(
     :raises ValueError: If launch arguments select the runner-owned transport.
     """
     reject_reserved_codex_transport_args(terminal_launch_args)
+    if deployment_policy is not None:
+        validate_codex_deployment_args(terminal_launch_args)
+        if bypass_sandbox or trust_project or trust_all_hooks or profile is not None:
+            raise ValueError(
+                "restricted deployment forbids bypass, project/hooks trust and ambient profiles"
+            )
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
         raise ImportError(
@@ -3637,6 +3769,23 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    if deployment_policy is not None:
+        private_home = codex_home / "deployment-home"
+        private_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env = {
+            key: value
+            for key, value in env.items()
+            if not key.startswith(("OPENAI_", "DATABRICKS_", "XDG_"))
+            and key
+            not in {"GH_CONFIG_DIR", "GLAB_CONFIG_DIR", "SSH_AUTH_SOCK", "BROWSER", "USERPROFILE"}
+        }
+        env.update(
+            HOME=str(private_home),
+            USERPROFILE=str(private_home),
+            XDG_CONFIG_HOME=str(private_home / ".config"),
+            XDG_DATA_HOME=str(private_home / ".local/share"),
+            XDG_CACHE_HOME=str(private_home / ".cache"),
+        )
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
@@ -3654,6 +3803,8 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    if deployment_policy is not None:
+        config_overrides.extend(['approval_policy="on-request"', 'sandbox_mode="workspace-write"'])
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -3691,6 +3842,8 @@ def build_codex_native_server(
         pinned_model=pinned_model,
         pinned_effort=reasoning_effort,
         model_catalog_rows=model_catalog_rows,
+        deployment_policy=deployment_policy,
+        deployment_spec_sha256=deployment_spec_sha256,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
@@ -4156,6 +4309,7 @@ def resolve_native_codex_launch(
     model: str | None,
     spec: AgentSpec | None = None,
     terminal_launch_args: Sequence[str] = (),
+    own_auth_only: bool = False,
 ) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
@@ -4226,6 +4380,24 @@ def resolve_native_codex_launch(
         _synthesize_codex_api_key_provider,
     )
     from omnigent.spec.types import DatabricksAuth
+
+    if own_auth_only:
+        if spec is not None and (
+            spec.executor.auth is not None
+            or spec.executor.profile
+            or spec.executor.config.get("profile")
+        ):
+            raise ValueError("deployment requires the native login, not a configured provider")
+        if not _codex_login_usable():
+            raise ValueError(
+                "deployment requires a usable native login; provider fallback is disabled"
+            )
+        return NativeCodexLaunch(
+            config_overrides=['model_provider="openai"'],
+            model=model,
+            profile=None,
+            summary="Codex native login (restricted deployment)",
+        )
 
     explicit = load_runtime_inference_config(load_config())
     bound = resolve_bound_provider(
@@ -4831,6 +5003,8 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
+    if getattr(app_server, "deployment_policy", None) is not None:
+        return {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()

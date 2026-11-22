@@ -5966,3 +5966,580 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
         assert session._certificate_failure is None
 
     _run(_t())
+
+
+def test_native_deployment_profile_reuses_credentials_without_personal_state(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "login"
+    target = tmp_path / "session"
+    source.mkdir()
+    target.mkdir()
+    (source / "auth.json").write_text("original synthetic credential")
+    (source / "memories_1.sqlite").write_text("operator personal memory")
+    (source / ".credentials.json").write_text("unrelated provider credential")
+    (source / "AGENTS.md").write_text("operator instructions")
+    (source / "hooks.json").write_text("{}")
+    (source / "config.toml").write_text(
+        'model_provider = "ambient"\n[model_providers.ambient]\n'
+        'base_url = "https://unused.invalid"\n[profiles.personal]\n'
+        'model_provider = "ambient"\n'
+    )
+    _populate_codex_home_config(
+        target,
+        source,
+        minimal_config=True,
+        include_personal_state=False,
+    )
+    assert (target / "auth.json").is_symlink()
+    assert (target / "auth.json").resolve() == source / "auth.json"
+    assert not (target / "memories_1.sqlite").exists()
+    assert not (target / ".credentials.json").exists()
+    assert not (target / "config.toml").exists()
+    assert not (target / "AGENTS.md").exists()
+    assert not (target / "hooks.json").exists()
+    (source / "auth.json").write_text("refreshed synthetic credential")
+    assert (target / "auth.json").read_text() == "refreshed synthetic credential"
+
+
+def test_native_deployment_profile_delivers_only_bundle_skills(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    bundle = tmp_path / "bundle"
+    source = tmp_path / "login"
+    target = tmp_path / "session"
+    for parent, name in [(bundle, "organization"), (source, "personal")]:
+        skill = parent / "skills" / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"# {name}\n")
+    populate_codex_skills_from_bundle(
+        target,
+        bundle,
+        "all",
+        source_codex_home=source,
+        include_host_skills=False,
+    )
+    assert (target / "skills" / "organization" / "SKILL.md").read_text() == "# organization\n"
+    assert not (target / "skills" / "personal").exists()
+
+
+def test_native_deployment_profile_rejects_unknown_reused_home(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "login"
+    target = tmp_path / "old-session"
+    source.mkdir()
+    target.mkdir()
+    (source / "auth.json").write_text("synthetic subscription")
+    (target / "config.toml").write_text('model_provider = "unknown"\n')
+    with pytest.raises(ValueError, match="not compatible"):
+        _populate_codex_home_config(
+            target, source, minimal_config=True, include_personal_state=False
+        )
+    assert (target / "config.toml").read_text() == 'model_provider = "unknown"\n'
+    assert not (target / "auth.json").exists()
+
+
+def test_native_deployment_profile_own_login_does_not_resolve_ambient(monkeypatch):
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setattr(app_server, "_codex_login_usable", lambda: True)
+    with patch(
+        "omnigent.inference_config.load_runtime_inference_config",
+        side_effect=AssertionError("ambient resolver called"),
+    ):
+        launch = app_server.resolve_native_codex_launch(model="selected", own_auth_only=True)
+    assert launch.model == "selected"
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.profile is None
+
+
+def test_native_deployment_profile_missing_login_fails_without_fallback(monkeypatch):
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setattr(app_server, "_codex_login_usable", lambda: False)
+    with pytest.raises(ValueError, match="provider fallback is disabled"):
+        app_server.resolve_native_codex_launch(model=None, own_auth_only=True)
+
+
+def test_native_deployment_profile_bound_tui_ignores_ambient_wrappers(tmp_path, monkeypatch):
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
+    from omnigent.runner.native import orchestration
+
+    captured = {}
+
+    class CapturedLaunch(Exception):
+        pass
+
+    class Registry:
+        async def launch_auxiliary_terminal(self, **kwargs):
+            captured.update(kwargs)
+            raise CapturedLaunch
+
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config",
+        lambda **kwargs: pytest.fail("ambient config read"),
+    )
+    server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=(0, 166, 0),
+        codex_path="/registered/codex",
+        codex_home=tmp_path / "profile",
+        env={},
+        deployment_policy=NativeDeploymentPolicy(),
+    )
+    config = orchestration._CodexNativeLaunchConfig(
+        workspace=tmp_path,
+        policy_server_url="http://127.0.0.1:1",
+        terminal_launch_args=None,
+        model_override=None,
+        external_session_id=None,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    with pytest.raises(CapturedLaunch):
+        _run(
+            orchestration._launch_codex_native_tui(
+                "bound-session",
+                Registry(),
+                lambda *args: None,
+                app_server=server,
+                launch_config=config,
+                bridge_dir=tmp_path / "bridge",
+                thread_id=None,
+                agent_spec=None,
+            )
+        )
+    assert captured["session_id"] == "bound-session"
+    assert captured["spec"].command == "/registered/codex"
+    assert captured["spec"].inherit_env is False
+    assert "--dangerously-bypass-hook-trust" not in captured["spec"].args
+    assert "--dangerously-bypass-approvals-and-sandbox" not in captured["spec"].args
+
+
+def _restricted_native_spec(**changes):
+    from omnigent.spec import AgentSpec, ExecutorSpec
+
+    config = {
+        "harness": "codex-native",
+        "native_deployment_policy": {},
+        "native_deployment_policy_version": 1,
+    }
+    config.update(changes)
+    return AgentSpec(
+        spec_version=1,
+        name="restricted-native",
+        executor=ExecutorSpec(type="omnigent", config=config),
+    )
+
+
+def test_native_deployment_profile_explicit_version_and_complete_spec_identity():
+    from dataclasses import replace
+
+    from omnigent.native.deployment_policy import (
+        deployment_policy_from_spec,
+        deployment_spec_identity,
+    )
+
+    spec = _restricted_native_spec()
+    assert deployment_policy_from_spec(spec).own_auth_only
+    assert deployment_spec_identity(spec) != deployment_spec_identity(
+        replace(spec, instructions="changed")
+    )
+    with pytest.raises(ValueError, match="version 1"):
+        deployment_policy_from_spec(_restricted_native_spec(native_deployment_policy_version=True))
+    with pytest.raises(ValueError, match="version 1"):
+        deployment_policy_from_spec(_restricted_native_spec(native_deployment_policy_version=2))
+    with pytest.raises(ValueError, match="exact known boolean"):
+        deployment_policy_from_spec(
+            _restricted_native_spec(native_deployment_policy={"unknown": True})
+        )
+
+
+def test_native_deployment_profile_child_env_uses_original_private_home(tmp_path, monkeypatch):
+    from omnigent.harnesses.codex_native.app_server import (
+        build_codex_native_server,
+        codex_terminal_env,
+    )
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy, deployment_spec_identity
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://ambient.invalid")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "synthetic")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "operator-gh"))
+    server = build_codex_native_server(
+        socket_path=tmp_path / "sock",
+        codex_home=tmp_path / "profile",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/registered/codex",
+        deployment_policy=NativeDeploymentPolicy(),
+        deployment_spec_sha256=deployment_spec_identity(_restricted_native_spec()),
+    )
+    env = codex_terminal_env(server)
+    assert env["HOME"] == str(tmp_path / "profile/deployment-home")
+    assert env["XDG_CONFIG_HOME"].startswith(env["HOME"] + "/")
+    assert (
+        "OPENAI_BASE_URL" not in env
+        and "DATABRICKS_CLIENT_SECRET" not in env
+        and "GH_CONFIG_DIR" not in env
+    )
+    assert 'approval_policy="on-request"' in server.config_overrides
+    assert 'sandbox_mode="workspace-write"' in server.config_overrides
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--yolo"],
+        ["-c", 'approval_policy="never"'],
+        ["--profile", "ambient"],
+        ["--sandbox", "danger-full-access"],
+    ],
+)
+def test_native_deployment_profile_rejects_unsafe_original_args(args):
+    from omnigent.harnesses.codex_native.app_server import validate_codex_deployment_args
+
+    with pytest.raises(ValueError, match="unsupported arguments"):
+        validate_codex_deployment_args(args)
+
+
+def test_native_deployment_profile_resume_only_same_generated_profile(tmp_path):
+    from omnigent.harnesses.codex_native.app_server import (
+        _prepare_deployment_profile,
+        _record_deployment_profile,
+    )
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    identity = "a" * 64
+    _prepare_deployment_profile(home, identity)
+    (home / "config.toml").write_text('model_provider="openai"')
+    (home / "hooks.json").write_text("{}")
+    _record_deployment_profile(home, identity)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        _prepare_deployment_profile(home, "b" * 64)
+    assert (home / "config.toml").exists()
+    _prepare_deployment_profile(home, identity)
+    assert not (home / "config.toml").exists() and not (home / "hooks.json").exists()
+
+
+def test_native_deployment_profile_changed_generated_config_is_preserved_and_rejected(tmp_path):
+    from omnigent.harnesses.codex_native.app_server import (
+        _prepare_deployment_profile,
+        _record_deployment_profile,
+    )
+
+    (tmp_path / "config.toml").write_text('model_provider="openai"')
+    (tmp_path / "hooks.json").write_text("{}")
+    _record_deployment_profile(tmp_path, "a" * 64)
+    changed = 'model_provider="ambient"'
+    (tmp_path / "config.toml").write_text(changed)
+    with pytest.raises(ValueError, match="generated config changed"):
+        _prepare_deployment_profile(tmp_path, "a" * 64)
+    assert (tmp_path / "config.toml").read_text() == changed
+    assert (tmp_path / "hooks.json").exists()
+
+
+def test_native_deployment_profile_existing_terminal_requires_same_persisted_spec(monkeypatch):
+    from omnigent.native.deployment_policy import (
+        deployment_policy_from_spec,
+        deployment_spec_identity,
+    )
+    from omnigent.runner.native import orchestration
+
+    spec = _restricted_native_spec()
+    ctx = orchestration.NativeLaunchContext(
+        session_id="original-session",
+        resource_registry=None,
+        publish_event=lambda *args: None,
+        agent_spec=spec,
+    )
+    original = SimpleNamespace(
+        deployment_policy=deployment_policy_from_spec(spec),
+        deployment_spec_sha256=deployment_spec_identity(spec),
+    )
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, "original-session", original)
+    orchestration._validate_codex_deployment_policy(
+        original.deployment_policy, ctx=ctx, existing=True
+    )
+    with pytest.raises(ValueError, match="persisted spec"):
+        orchestration._validate_codex_deployment_policy(None, ctx=ctx, existing=True)
+    with pytest.raises(ValueError, match="identity"):
+        orchestration._validate_codex_deployment_policy(
+            original.deployment_policy,
+            ctx=orchestration.dataclasses.replace(
+                ctx, agent_spec=_restricted_native_spec(extra="different")
+            ),
+            existing=True,
+        )
+
+
+def test_native_deployment_profile_original_registry_bound_dispatch(monkeypatch):
+    from omnigent.harness_plugins import native_provider_for_key
+    from omnigent.runner import native
+    from omnigent.runner.native import orchestration
+
+    resolve_hook = orchestration.resolve_hook
+    provider = native_provider_for_key("codex")
+    assert (
+        resolve_hook(provider, "validate_deployment_policy")
+        is orchestration._validate_codex_deployment_policy
+    )
+    adapter = AsyncMock()
+    monkeypatch.setattr(native, "_launch_codex", adapter)
+    ctx = orchestration.NativeLaunchContext(
+        session_id="existing-bound-session",
+        resource_registry=SimpleNamespace(terminal_registry=None),
+        publish_event=lambda *args: None,
+        agent_spec=_restricted_native_spec(),
+    )
+    assert (
+        _run(
+            orchestration._launch_native_terminal(
+                "codex-native", ctx, ensure_locks={}, reraise=True
+            )
+        )
+        is True
+    )
+    assert adapter.await_args.args[0] is ctx
+
+
+def test_native_deployment_profile_original_registry_unknown_policy_provider_rejected(monkeypatch):
+    from omnigent.runner import native
+    from omnigent.runner.native import orchestration
+
+    adapter = AsyncMock()
+    monkeypatch.setattr(native, "_launch_claude", adapter)
+    ctx = orchestration.NativeLaunchContext(
+        session_id="bound-unavailable",
+        resource_registry=SimpleNamespace(terminal_registry=None),
+        publish_event=lambda *args: None,
+        agent_spec=_restricted_native_spec(),
+    )
+    with pytest.raises(RuntimeError, match="has not implemented"):
+        _run(
+            orchestration._launch_native_terminal(
+                "claude-native", ctx, ensure_locks={}, reraise=True
+            )
+        )
+    adapter.assert_not_awaited()
+
+
+def test_native_deployment_profile_existing_bound_dispatch_resolves_persisted_spec(monkeypatch):
+    from omnigent.native.deployment_policy import (
+        deployment_policy_from_spec,
+        deployment_spec_identity,
+    )
+    from omnigent.runner.native import orchestration
+
+    spec = _restricted_native_spec()
+    running = SimpleNamespace(
+        deployment_policy=deployment_policy_from_spec(spec),
+        deployment_spec_sha256=deployment_spec_identity(spec),
+    )
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, "bound-resume", running)
+    resolver = AsyncMock(return_value=orchestration.ResolvedSpec(spec, None))
+    ctx = orchestration.NativeLaunchContext(
+        session_id="bound-resume",
+        resource_registry=SimpleNamespace(
+            terminal_registry=SimpleNamespace(get=lambda *args: object())
+        ),
+        publish_event=lambda *args: None,
+    )
+    assert (
+        _run(
+            orchestration._launch_native_terminal(
+                "codex-native", ctx, ensure_locks={}, resolve_agent_spec=resolver, reraise=True
+            )
+        )
+        is True
+    )
+    resolver.assert_awaited_once()
+
+
+def test_native_deployment_profile_foreign_existing_skill_rejected(tmp_path):
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "SKILL.md").write_text("unregistered")
+    profile = tmp_path / "profile"
+    (profile / "skills").mkdir(parents=True)
+    (profile / "skills/foreign").symlink_to(foreign, target_is_directory=True)
+    with pytest.raises(ValueError, match="not from the persisted bundle"):
+        populate_codex_skills_from_bundle(profile, None, "all", include_host_skills=False)
+    assert (profile / "skills/foreign").is_symlink()
+
+
+def test_native_deployment_profile_policy_hook_failure_does_not_degrade(tmp_path, monkeypatch):
+    from omnigent.harnesses.codex_native import app_server as module
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy, deployment_spec_identity
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "auth.json").write_text("{}")
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(module, "_codex_cli_version", AsyncMock(return_value=(0, 166, 0)))
+    server = module.build_codex_native_server(
+        socket_path=tmp_path / "socket",
+        codex_home=tmp_path / "profile",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/not-executed/codex",
+        ap_server_url="http://127.0.0.1:1",
+        deployment_policy=NativeDeploymentPolicy(),
+        deployment_spec_sha256=deployment_spec_identity(_restricted_native_spec()),
+        reconcile_process_registry=False,
+    )
+    server._spawn_app_server_process = AsyncMock()
+    server._wait_until_ready = AsyncMock(return_value=SimpleNamespace(close=AsyncMock()))
+    server._trust_policy_hooks = AsyncMock(side_effect=RuntimeError("synthetic hook refusal"))
+    server.close = AsyncMock()
+    with pytest.raises(RuntimeError, match="could not be trusted"):
+        _run(server.start())
+    server._trust_policy_hooks.assert_awaited_once()
+    server.close.assert_awaited_once()
+    assert server.policy_hook_disabled_reason is None
+
+
+def test_native_deployment_profile_missing_identity_stops_before_spawn(tmp_path):
+    from omnigent.harnesses.codex_native.app_server import build_codex_native_server
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
+
+    server = build_codex_native_server(
+        socket_path=tmp_path / "socket",
+        codex_home=tmp_path / "profile",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/not-executed/codex",
+        deployment_policy=NativeDeploymentPolicy(),
+    )
+    server._spawn_app_server_process = AsyncMock()
+    with pytest.raises(ValueError, match="persisted spec"):
+        _run(server.start())
+    server._spawn_app_server_process.assert_not_awaited()
+
+
+def test_native_deployment_profile_existing_unknown_provider_cannot_skip_validation():
+    from omnigent.runner.native import orchestration
+
+    resolver = AsyncMock(return_value=_restricted_native_spec())
+    ctx = orchestration.NativeLaunchContext(
+        session_id="existing-unsupported",
+        resource_registry=SimpleNamespace(
+            terminal_registry=SimpleNamespace(get=lambda *args: object())
+        ),
+        publish_event=lambda *args: None,
+    )
+    with pytest.raises(RuntimeError, match="has not implemented"):
+        _run(
+            orchestration._launch_native_terminal(
+                "claude-native", ctx, ensure_locks={}, resolve_agent_spec=resolver, reraise=True
+            )
+        )
+    resolver.assert_awaited_once()
+
+
+def test_native_deployment_profile_original_spec_load_preserves_typed_policy(tmp_path):
+    from omnigent.native.deployment_policy import (
+        NativeDeploymentPolicy,
+        deployment_policy_from_spec,
+    )
+    from omnigent.spec import load
+
+    (tmp_path / "config.yaml").write_text(
+        json.dumps(
+            {
+                "spec_version": 1,
+                "name": "restricted-native",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {
+                        "harness": "codex-native",
+                        "native_deployment_policy": {
+                            "own_auth_only": True,
+                            "trust_project": False,
+                            "trust_hooks": False,
+                            "allow_project_config": False,
+                            "personal_state": False,
+                            "host_skills": False,
+                            "allow_bypass": False,
+                        },
+                        "native_deployment_policy_version": 1,
+                    },
+                },
+            }
+        )
+    )
+    spec = load(tmp_path, expand_env=False, enforce_handler_allowlist=True)
+    assert deployment_policy_from_spec(spec) == NativeDeploymentPolicy()
+    assert type(spec.executor.config["native_deployment_policy_version"]) is int
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+def test_native_deployment_profile_catalog_probe_only_legacy(tmp_path, monkeypatch, restricted):
+    from omnigent.harnesses.codex_native import app_server, bridge
+    from omnigent.runner.native import orchestration
+    from omnigent.spec import AgentSpec, ExecutorSpec
+
+    class AfterCatalog(Exception):
+        pass
+
+    config = orchestration._CodexNativeLaunchConfig(
+        workspace=tmp_path,
+        policy_server_url="http://127.0.0.1:1",
+        terminal_launch_args=None,
+        model_override=None,
+        external_session_id=None,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    monkeypatch.setattr(
+        orchestration, "_codex_native_launch_config", AsyncMock(return_value=config)
+    )
+    monkeypatch.setattr(bridge, "prepare_bridge_dir", lambda *args: tmp_path / "bridge")
+    monkeypatch.setattr(bridge, "read_bridge_state", lambda *args: None)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._find_codex_cli", lambda: "/not-executed/codex"
+    )
+    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.inference_config.binding_for_harness", lambda *args: None)
+    monkeypatch.setattr(
+        app_server,
+        "resolve_native_codex_launch",
+        lambda **kwargs: app_server.NativeCodexLaunch(
+            config_overrides=[], model="explicit", profile=None
+        ),
+    )
+    probe = unittest.mock.Mock(return_value=None)
+    monkeypatch.setattr(app_server, "fresh_codex_launch_catalog", probe)
+    monkeypatch.setattr(
+        app_server,
+        "codex_session_meta_model_provider",
+        unittest.mock.Mock(side_effect=AfterCatalog),
+    )
+    spec = (
+        _restricted_native_spec()
+        if restricted
+        else AgentSpec(spec_version=1, name="legacy", executor=ExecutorSpec())
+    )
+    with pytest.raises(AfterCatalog):
+        _run(
+            orchestration._auto_create_codex_terminal(
+                "catalog-bound", None, lambda *args: None, agent_spec=spec
+            )
+        )
+    assert probe.call_count == (0 if restricted else 1)
