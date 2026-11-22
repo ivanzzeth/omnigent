@@ -20,8 +20,39 @@ from omnigent.harnesses.codex_native import app_server, launch_args
 from tests.harnesses.codex_native.app_server._support import (
     _PLAIN_TOOL_APPROVALS,
     _disable_codex_startup_rpc,
+    _set_codex_version,
     _test_app_server,
 )
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+async def test_start_requires_managed_mcp_only_for_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restricted: bool
+) -> None:
+    """Inspect the actual startup config at the original process-launch boundary."""
+    from omnigent.native.deployment_policy import NativeDeploymentPolicy
+
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _set_codex_version(monkeypatch, (0, 166, 0))
+    server = _test_app_server(tmp_path, tmp_path / "private", tmp_path / "bridge", tmp_path)
+    server.deployment_policy = NativeDeploymentPolicy() if restricted else None
+    server.deployment_spec_sha256 = "a" * 64 if restricted else None
+    server.ap_server_url = "http://127.0.0.1:1"
+    server.reconcile_process_registry = False
+
+    async def inspect_launch(_listen: str) -> None:
+        config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        managed = config["mcp_servers"]["omnigent"]
+        assert managed.get("required") is (True if restricted else None)
+        assert managed["command"] == "/new/python"
+        assert "serve-mcp" in managed["args"]
+        raise RuntimeError("inspected-before-process-launch")
+
+    monkeypatch.setattr(server, "_spawn_app_server_process", inspect_launch)
+    with pytest.raises(RuntimeError, match="inspected-before-process-launch"):
+        await server.start()
 
 
 async def test_start_upserts_mcp_server_config_across_relaunches(

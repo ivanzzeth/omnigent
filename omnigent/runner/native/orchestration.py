@@ -5691,7 +5691,7 @@ async def _auto_create_codex_terminal(
     )
 
     write_mcp_bridge_config(bridge_dir)
-    mcp_overrides = codex_mcp_config_overrides(bridge_dir)
+    mcp_overrides = codex_mcp_config_overrides(bridge_dir, required=deployment_policy is not None)
 
     # Omnigent coordinates for the codex-native policy hook. The hook runs as a
     # separate subprocess that POSTs tool calls to /policies/evaluate, so
@@ -5935,6 +5935,21 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+            if deployment_policy is not None:
+                from omnigent.harnesses.codex_native.app_server import (
+                    record_codex_managed_mcp_status,
+                )
+
+                if retained_resume_client is None:
+                    raise RuntimeError("Required managed MCP has no retained thread client")
+                # Resume has no local absolute startup budget; caller cancellation
+                # still owns it. Bound only this single diagnostic suboperation.
+                await record_codex_managed_mcp_status(
+                    retained_resume_client,
+                    session_id=session_id,
+                    thread_id=launch_config.external_session_id,
+                    timeout=10.0,
+                )
             # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
@@ -6002,6 +6017,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                required_managed_mcp=deployment_policy is not None,
                 app_server=app_server,
                 terminal_instance=terminal_instance,
                 routing_summary=_codex_launch.summary,
@@ -6245,6 +6261,7 @@ async def _codex_discover_thread_and_forward(
     workspace: str,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    required_managed_mcp: bool = False,
     app_server: CodexNativeAppServer | None = None,
     terminal_instance: TerminalInstance | None = None,
     login_required: bool = False,
@@ -6278,6 +6295,7 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param required_managed_mcp: Capture the required managed server's actual thread status.
     :param app_server: This launch's process, retained for failure diagnostics
         before cleanup. A later launch may replace the session registry entry.
     :param terminal_instance: This launch's TUI, retained to detect early exit
@@ -6542,6 +6560,23 @@ async def _codex_discover_thread_and_forward(
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
             clear_bridge_startup_error(bridge_dir)
+        if required_managed_mcp:
+            from omnigent.harnesses.codex_native.app_server import record_codex_managed_mcp_status
+
+            await record_codex_managed_mcp_status(
+                event_client,
+                session_id=session_id,
+                thread_id=thread_id,
+                timeout=(
+                    discovery_started_at
+                    + (
+                        thread_start_timeout_seconds
+                        if thread_start_timeout_seconds is not None
+                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                    )
+                    - time.monotonic()
+                ),
+            )
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

@@ -46,6 +46,7 @@ def startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Startup:
     """Provide an owned launch without starting subprocesses or network clients."""
     monkeypatch.delenv(_STDERR_ENV, raising=False)
     close_order: list[str] = []
+    process = SimpleNamespace(pid=4242, returncode=None)
     app_server = CodexNativeAppServer(
         codex_path="/test/codex",
         socket_path=tmp_path / "app-server.sock",
@@ -54,7 +55,7 @@ def startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Startup:
         config_overrides=[],
         cwd=tmp_path / "workspace",
         bridge_dir=tmp_path,
-        proc=SimpleNamespace(pid=4242, returncode=None),  # type: ignore[arg-type]
+        proc=process,  # type: ignore[arg-type]
         codex_cli_version=(0, 154, 0),
         recent_stderr=[],
     )
@@ -64,6 +65,7 @@ def startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Startup:
 
     async def close_app_server() -> None:
         close_order.append("app_server")
+        process.returncode = 0
         app_server.proc = None
         app_server.stderr_task = None
 
@@ -108,6 +110,48 @@ def _failure_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord
         for record in caplog.records
         if getattr(record, "event_name", None) == "codex_thread_start_failed"
     ]
+
+
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_discovered_thread_status_uses_original_client_before_bridge_ready(
+    monkeypatch: pytest.MonkeyPatch, startup: _Startup, required: bool, malformed: bool
+) -> None:
+    """A failed vendor diagnostic cannot publish fresh bridge state."""
+    startup.event_client.request = AsyncMock(
+        return_value={
+            "result": {
+                "data": []
+                if malformed
+                else [
+                    {
+                        "name": "omnigent",
+                        "tools": {},
+                        "runtimeStatus": "starting",
+                        "serverCapabilities": None,
+                    }
+                ]
+            }
+        }
+    )
+    monkeypatch.setattr(
+        forwarder, "wait_for_thread_started", AsyncMock(return_value="owned-thread")
+    )
+
+    def stop_before_http(_name: str) -> str:
+        raise RuntimeError("after-status-before-http")
+
+    monkeypatch.setattr(orchestration, "_required_runner_env", stop_before_http)
+    expected = "status unavailable" if required and malformed else "after-status-before-http"
+    with pytest.raises(RuntimeError, match=expected):
+        await _discover(startup, required_managed_mcp=required)
+    if required:
+        startup.event_client.request.assert_awaited_once_with(
+            "mcpServerStatus/list", {"threadId": "owned-thread", "serverName": "omnigent"}
+        )
+    else:
+        startup.event_client.request.assert_not_awaited()
+    assert (read_bridge_state(startup.bridge_dir) is None) is (required and malformed)
 
 
 @pytest.mark.parametrize(

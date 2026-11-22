@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import traceback
 from typing import cast
 from unittest.mock import AsyncMock
@@ -17,6 +18,85 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
 )
+
+
+@pytest.mark.parametrize("status", ["connected", "starting", None])
+async def test_managed_mcp_status_reads_bound_thread_and_logs_only_safe_inventory(
+    caplog: pytest.LogCaptureFixture, status: str | None
+) -> None:
+    client = CodexAppServerClient(ws_url="ws://unused")
+    client.request = AsyncMock(
+        return_value={
+            "result": {
+                "data": [
+                    {
+                        "name": "omnigent",
+                        "tools": {"lingxiao__issue_get": {"secret_schema": "not-logged"}},
+                        "runtimeStatus": status,
+                        "serverCapabilities": {} if status == "connected" else None,
+                        "toolsError": "Authorization: Bearer synthetic-secret",
+                    }
+                ],
+                "nextCursor": None,
+            }
+        }
+    )
+    with caplog.at_level(logging.INFO):
+        await app_server.record_codex_managed_mcp_status(
+            client, session_id="owned-session", thread_id="owned-thread", timeout=1.0
+        )
+    client.request.assert_awaited_once_with(
+        "mcpServerStatus/list", {"threadId": "owned-thread", "serverName": "omnigent"}
+    )
+    record = next(r for r in caplog.records if r.event_name == "codex_managed_mcp_status")
+    assert record.session_id == "owned-session"
+    assert record.attributes["thread_id"] == "owned-thread"
+    assert record.attributes["tool_names"] == ["lingxiao__issue_get"]
+    assert record.attributes["tool_count"] == 1
+    assert record.attributes["runtime_status"] == status
+    assert record.attributes["server_capabilities_is_null"] is (status != "connected")
+    assert "synthetic-secret" not in caplog.text and "not-logged" not in caplog.text
+    assert "ready" not in record.attributes
+
+
+@pytest.mark.parametrize("failure", ["rpc", "shape", "expired"])
+async def test_managed_mcp_status_failure_keeps_safe_cause_before_refusal(
+    caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    client = CodexAppServerClient(ws_url="ws://unused")
+    client.request = AsyncMock(
+        side_effect=(
+            CodexAppServerResponseError(
+                {"code": -32603, "message": "Authorization: Bearer synthetic-secret"}
+            )
+            if failure == "rpc"
+            else None
+        ),
+        return_value={"result": {"data": []}},
+    )
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="status unavailable"):
+        await app_server.record_codex_managed_mcp_status(
+            client,
+            session_id="owned-session",
+            thread_id="owned-thread",
+            timeout=0.0 if failure == "expired" else 1.0,
+        )
+    record = next(r for r in caplog.records if r.event_name == "codex_managed_mcp_status")
+    assert (
+        record.attributes["error_class"]
+        == (
+            {
+                "rpc": "CodexAppServerResponseError",
+                "shape": "ValueError",
+                "expired": "TimeoutError",
+            }[failure]
+        )
+    )
+    assert record.attributes["error_code"] == (-32603 if failure == "rpc" else None)
+    assert record.attributes["error_message"]
+    assert "synthetic-secret" not in caplog.text
+    if failure == "expired":
+        client.request.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

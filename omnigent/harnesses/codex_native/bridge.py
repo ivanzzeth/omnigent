@@ -389,6 +389,7 @@ def codex_mcp_config_overrides(
     bridge_dir: Path,
     *,
     python_executable: str | None = None,
+    required: bool = False,
 ) -> list[str]:
     """
     Return ``-c`` config overrides that register the Omnigent MCP server.
@@ -403,6 +404,7 @@ def codex_mcp_config_overrides(
         ``bridge.json`` and (eventually) ``tool_relay.json``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
+    :param required: Refuse thread startup when the managed MCP cannot initialize.
     :returns: Codex ``-c`` config override strings, e.g.
         ``['mcp_servers.omnigent.command="python"', ...]``.
     """
@@ -423,6 +425,7 @@ def codex_mcp_config_overrides(
     return [
         f'mcp_servers.omnigent.command="{python}"',
         f"mcp_servers.omnigent.args={args_toml}",
+        *(["mcp_servers.omnigent.required=true"] if required else []),
     ]
 
 

@@ -75,7 +75,10 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
-def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
+@pytest.mark.parametrize("required", [False, True])
+def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(
+    tmp_path: Path, required: bool
+) -> None:
     """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
 
     The MCP server starts in the session workspace, and without ``-I`` python puts
@@ -84,7 +87,8 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
-    overrides = codex_mcp_config_overrides(tmp_path)
+    overrides = codex_mcp_config_overrides(tmp_path, required=required)
+    assert ("mcp_servers.omnigent.required=true" in overrides) is required
 
     prefix = "mcp_servers.omnigent.args="
     raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))

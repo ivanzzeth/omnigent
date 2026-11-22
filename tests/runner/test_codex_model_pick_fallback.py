@@ -872,3 +872,76 @@ async def test_required_relay_is_prepared_before_codex_start(
         with pytest.raises(RuntimeError, match="after-relay-start-boundary"):
             await launch
         assert harness.events == ["relay-prepare"]
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_resume_status_precedes_bridge_publication_on_same_retained_client(
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    restricted: bool,
+    malformed: bool,
+) -> None:
+    """Resume diagnostics use the original subscription before exposing its state."""
+
+    harness = codex_launch_harness
+    thread_id = "00000000-0000-4000-8000-000000000001"
+    harness.snapshot.clear()
+    harness.snapshot["external_session_id"] = thread_id
+    if restricted:
+        harness.agent_spec.executor.config.update(
+            {"native_deployment_policy": {}, "native_deployment_policy_version": 1}
+        )
+    harness.app_server.codex_cli_version = (0, 166, 0)
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(_SESSION_ID)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=_SESSION_ID,
+            thread_id=thread_id,
+            socket_path="ws://old",
+            codex_home="/old",
+        ),
+    )
+
+    async def status(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert method == "mcpServerStatus/list"
+        assert params == {"threadId": thread_id, "serverName": "omnigent"}
+        assert codex_native_bridge.read_bridge_state(bridge_dir) is None
+        return {
+            "result": {
+                "data": []
+                if malformed
+                else [{"name": "omnigent", "tools": {}, "runtimeStatus": "starting"}]
+            }
+        }
+
+    harness.event_client.request = AsyncMock(side_effect=status)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", AsyncMock()
+    )
+    monkeypatch.setattr(
+        codex_app, "preload_codex_thread_for_resume", AsyncMock(return_value=harness.event_client)
+    )
+    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
+    launch = runner_native._auto_create_codex_terminal(
+        _SESSION_ID,
+        harness.registry,
+        lambda *_args: None,
+        agent_spec=harness.agent_spec,
+        server_client=harness.server_client,
+        ensure_comment_relay=AsyncMock(),
+    )
+    if restricted and malformed:
+        with pytest.raises(RuntimeError, match="status unavailable"):
+            await launch
+        harness.registry.launch_auxiliary_terminal.assert_not_awaited()
+        assert codex_native_bridge.read_bridge_state(bridge_dir) is None
+    else:
+        await launch
+        assert codex_native_bridge.read_bridge_state(bridge_dir).thread_id == thread_id
+    assert harness.event_client.request.await_count == int(restricted)
+    assert (
+        "mcp_servers.omnigent.required=true" in harness.builds[0]["extra_config_overrides"]
+    ) is restricted
+    assert (harness.builds[0].get("deployment_policy") is not None) is restricted

@@ -281,6 +281,7 @@ def _codex_mcp_server_config_section(
     python_executable: str | None = None,
     *,
     routed_spawns: bool = False,
+    required: bool = False,
 ) -> str:
     """
     Build the generated Codex MCP server TOML section.
@@ -292,6 +293,7 @@ def _codex_mcp_server_config_section(
         :data:`sys.executable`.
     :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
         which pre-approves the cross-harness redirect tools too.
+    :param required: Refuse thread startup when the managed MCP cannot initialize.
     :returns: TOML text for ``[mcp_servers.omnigent]`` and its
         framework-managed tool approvals.
     """
@@ -309,10 +311,12 @@ def _codex_mcp_server_config_section(
         f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
         for tool in framework_approved_tools(routed_spawns=routed_spawns)
     )
+    required_config = "required = true\n" if required else ""
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
-        f"args = [{args_toml}]\n\n"
+        f"args = [{args_toml}]\n"
+        f"{required_config}\n"
         f"{approvals}"
     )
 
@@ -915,6 +919,7 @@ def _inject_mcp_server_config(
     *,
     mcp_servers: _JsonObject,
     routed_spawns: bool = False,
+    required: bool = False,
 ) -> None:
     """
     Refresh user MCPs and inject Omnigent's relay into the private config.
@@ -933,6 +938,7 @@ def _inject_mcp_server_config(
     :param mcp_servers: Current source-owned MCP inventory, including profile overrides.
     :param routed_spawns: ``True`` for an auto-harness Smart Routing session,
         which pre-approves the cross-harness redirect tools too.
+    :param required: Make the managed server mandatory for thread startup.
     :returns: None.
     """
     config_path = codex_home / "config.toml"
@@ -948,7 +954,7 @@ def _inject_mcp_server_config(
         document["mcp_servers"] = servers
     updated = tomlkit.dumps(document).rstrip()
     section = _codex_mcp_server_config_section(
-        bridge_dir, python_executable, routed_spawns=routed_spawns
+        bridge_dir, python_executable, routed_spawns=routed_spawns, required=required
     )
     rendered = f"{updated}\n\n{section}" if updated else section
     _write_private_config(config_path, rendered)
@@ -1396,6 +1402,88 @@ _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(
     maxsize=8,
     ttl=_MODEL_DISCOVERY_CACHE_SECONDS,
 )
+
+
+async def record_codex_managed_mcp_status(
+    client: CodexAppServerClient, *, session_id: str, thread_id: str, timeout: float
+) -> None:
+    """Record the bound thread's vendor inventory without exposing tool arguments.
+
+    This single diagnostic read does not infer readiness from an empty catalog
+    or a starting connection. Codex's required-server startup gate owns that.
+    """
+    snapshot: _JsonObject = {"thread_id": thread_id, "server_name": "omnigent"}
+    log_extra = debug_event("codex_managed_mcp_status", session_id=session_id)
+    log_extra["attributes"] = snapshot
+    try:
+        if timeout <= 0:
+            raise TimeoutError("Original native startup deadline expired before MCP status")
+        response = await asyncio.wait_for(
+            client.request(
+                "mcpServerStatus/list", {"threadId": thread_id, "serverName": "omnigent"}
+            ),
+            timeout=min(timeout, 10.0),
+        )
+        result = response.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise ValueError("Invalid managed MCP status result")
+        rows = result["data"]
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("name") != "omnigent":
+            raise ValueError("Managed MCP status did not identify exactly one bound server")
+        row = rows[0]
+        tools = row.get("tools")
+        status = row.get("runtimeStatus")
+        tools_error = row.get("toolsError")
+        if (
+            not isinstance(tools, dict)
+            or status
+            not in {
+                None,
+                "notStarted",
+                "starting",
+                "connected",
+                "authenticationRequired",
+                "failed",
+                "cancelled",
+                "disabled",
+            }
+            or (tools_error is not None and not isinstance(tools_error, str))
+        ):
+            raise ValueError("Invalid managed MCP status fields")
+        snapshot.update(
+            tool_names=sorted(redact_log_text(name) for name in tools),
+            tool_count=len(tools),
+            runtime_status=status,
+            tools_error=(
+                redact_log_text(tools_error, include_whitespace_credentials=True)[:2048]
+                if tools_error is not None
+                else None
+            ),
+            server_capabilities_is_null=row.get("serverCapabilities") is None,
+            inventory_complete=result.get("nextCursor") is None,
+        )
+    except Exception as exc:  # noqa: BLE001 - retain a safe diagnostic before refusing startup
+        snapshot.update(
+            error_class=type(exc).__name__,
+            error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
+            error_message=redact_log_text(
+                (exc.message or "") if isinstance(exc, CodexAppServerResponseError) else str(exc),
+                include_whitespace_credentials=True,
+            )[:2048],
+        )
+        _logger.error(
+            "Codex managed MCP status: %s",
+            json.dumps(snapshot, sort_keys=True),
+            extra=log_extra,
+        )
+        raise RuntimeError(
+            "Required managed MCP status unavailable; see safe diagnostic"
+        ) from None
+    _logger.info(
+        "Codex managed MCP status: %s",
+        json.dumps(snapshot, sort_keys=True),
+        extra=log_extra,
+    )
 
 
 async def discover_codex_model_options(*, codex_path: str | None = None) -> list[_JsonObject]:
@@ -2356,6 +2444,7 @@ class CodexNativeAppServer:
             self.python_executable,
             mcp_servers=mcp_servers,
             routed_spawns=routed_spawns,
+            required=self.deployment_policy is not None,
         )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
