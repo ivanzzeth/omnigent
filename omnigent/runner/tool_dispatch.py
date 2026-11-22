@@ -541,8 +541,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     and that pi-native registers via ``pi.registerTool``: the spec-gated builtin
     surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
     agent-discovery, policy, and terminal families) plus the ``sys_os_*`` tools,
-    relayed unconditionally so they override any harness-static versions and get
-    centralized policy enforcement on the Omnigent server.
+    relayed for legacy sessions so they override harness-static versions and get
+    centralized policy enforcement. Required deployments use the original
+    Spec-selected surface instead of adding OS capabilities implicitly.
 
     Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
     ``"function"`` sub-dict of an OpenAI tool schema), which is exactly what
@@ -553,6 +554,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         gate can't be evaluated without the spec), mirroring the relay.
     :returns: Flat tool schemas for native bridges.
     """
+    from omnigent.native.deployment_policy import deployment_policy_from_spec
     from omnigent.tools.builtins.agents import (
         SysAgentDownloadTool,
         SysAgentGetTool,
@@ -566,6 +568,11 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     )
     from omnigent.tools.builtins.update_comment import UpdateCommentTool
 
+    selected = (
+        _granted_tool_names(spec)
+        if spec is not None and deployment_policy_from_spec(spec) is not None
+        else None
+    )
     schemas: list[_JsonObject] = []
 
     def _append(function_dict: _JsonObject) -> None:
@@ -617,9 +624,11 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             if function is not None:
                 _append(function)
 
-    # Relay OS tools unconditionally for centralized policy enforcement.
-    # Their schemas are static and need no OS environment or working directory.
+    # Legacy native relays retain implicit OS tools. Required deployments
+    # expose only OS tools selected by the original ToolManager/Spec authority.
     for tool_cls in OS_ENV_TOOL_TYPES:
+        if selected is not None and tool_cls.name() not in selected:
+            continue
         tool_schema = _string_object_dict(tool_cls.get_schema())
         function = _string_object_dict(tool_schema.get("function")) if tool_schema else None
         if function is not None:
@@ -976,9 +985,9 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
 
     Mirrors advertisement: the names ``ToolManager`` registers, spec-local
     tools by declared name (no workdir load needed), and ``sys_os_*`` when the
-    session runs a native harness, whose relay advertises them unconditionally
-    (see :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned
-    and resolved by the MCP manager, never by this set.
+    session runs a legacy native harness. Required deployments retain only
+    the Spec-selected surface (see :func:`build_native_relay_tool_schemas`).
+    MCP tools are runner-owned and resolved by the MCP manager, never by this set.
 
     :param agent_spec: The session's resolved agent spec.
     :param harness: Canonical harness the session runs, from
@@ -997,7 +1006,9 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     finally:
         manager.shutdown()
     names.update(info.name for info in agent_spec.local_tools)
-    if is_native_harness(harness):
+    from omnigent.native.deployment_policy import deployment_policy_from_spec
+
+    if is_native_harness(harness) and deployment_policy_from_spec(agent_spec) is None:
         names.update(_OS_ENV_TOOLS)
     granted = frozenset(names)
     if len(_granted_tool_names_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
