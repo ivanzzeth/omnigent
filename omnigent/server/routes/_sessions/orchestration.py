@@ -12524,7 +12524,7 @@ async def _handle_mcp_tools_call(
             elicitation_id = await _register_policy_elicitation(
                 session_id,
                 call_result,
-                json.dumps(arguments)[:1024],
+                f"{namespaced_name}({json.dumps(arguments)})"[:1024],
                 conversation_store,
             )
             # Keep the reviewed call and deferred writes together until approval.

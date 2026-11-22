@@ -886,3 +886,69 @@ async def test_retry_dispatches_policy_owned_arguments(
             assert "transformed_arguments" not in json.loads(initial["result"]["requestState"])
         finally:
             _pending_policy_ask_writes.pop(eid, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", [PolicyAction.ASK, PolicyAction.DENY])
+async def test_mcp_policy_preview_keeps_trusted_tool_and_original_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    approval_state: tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine],
+    action: PolicyAction,
+) -> None:
+    """Exercise the MCP producer and real elicitation builder, never an OS handler."""
+    store, _conv, _engine = approval_state
+    tool = "lingxiao__issue_get"
+    arguments = {"issue_id": "synthetic-current-issue", "include_activity": False}
+    encoded_before = json.dumps(arguments)
+    evaluated: list[EvaluationContext] = []
+    events: list[dict[str, Any]] = []
+    dispatched: list[str] = []
+
+    class Engine(_FixedPolicyEngine):
+        async def evaluate(self, ctx: EvaluationContext) -> PolicyResult:
+            evaluated.append(ctx)
+            return self.result
+
+    async def forbidden_runner(*args: Any) -> None:
+        dispatched.append("attempted")
+        raise AssertionError("unapproved MCP call reached runner")
+
+    engine = Engine(
+        PolicyResult(action=action, reason="fixture policy", deciding_policies=["fixture"])
+    )
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "fixture-spec")
+    monkeypatch.setattr(
+        sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
+    )
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", forbidden_runner)
+    monkeypatch.setattr(
+        orchestration.session_stream, "publish", lambda sid, event: events.append(event)
+    )
+    response = await _handle_mcp_tools_call(
+        rpc_id=1,
+        session_id=_SESSION_ID,
+        params={"name": tool, "arguments": arguments},
+        conversation_store=store,
+        agent_store=_StubAgentStore(),
+        runner_router=None,
+    )  # type: ignore[arg-type]
+    body = json.loads(bytes(response.body))
+    assert json.dumps(arguments) == encoded_before
+    assert evaluated[0].tool_name == tool
+    assert evaluated[0].content == {"name": tool, "arguments": arguments}
+    assert not dispatched
+    if action == PolicyAction.ASK:
+        assert body["result"]["resultType"] == "input_required"
+        assert len(events) == 1
+        preview = events[0]["params"]["content_preview"]
+        assert preview == f"{tool}({encoded_before})"
+        assert json.loads(preview[len(tool) + 1 : -1]) == arguments
+        eid = events[0]["elicitation_id"]
+        try:
+            pending = _pending_policy_ask_writes[eid]
+            assert pending.reviewed_arguments == arguments
+            assert pending.mcp_call_identity[:2] == (_SESSION_ID, tool)
+        finally:
+            _pending_policy_ask_writes.pop(eid, None)
+    else:
+        assert "error" in body and not events
