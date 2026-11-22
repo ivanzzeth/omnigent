@@ -2070,3 +2070,26 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
     assert "idle watchdog" in message, message
     assert "external_session_status" in message, message
     assert "No route to host" in message, message
+
+
+async def test_native_receipt_survives_original_completed_event_serialization() -> None:
+    """Delivery completion retains its opaque receipt, without becoming model completion."""
+    from omnigent.inner.executor import MockExecutor, TurnComplete
+    from omnigent.native.input_receipt import NativeInputReceipt
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CompletedEvent
+
+    receipt: NativeInputReceipt = {
+        "input_stable_id": "a" * 32,
+        "terminal_response_id": "opaque-native-turn",
+    }
+    ctx = TurnContext("delivery-response", asyncio.Queue(), asyncio.Event(), session_id="sid")
+    ctx.input_stable_id = "a" * 32
+    app = ExecutorAdapter(MockExecutor)
+    app._translate_event(TurnComplete(native_input_receipt=receipt), ctx)
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    event = await app._build_terminal_event(ctx, model="fixture", run_task=task, sequence=1)
+    restored = CompletedEvent.model_validate_json(event.model_dump_json())
+    assert restored.response.native_input_receipt == receipt
+    assert restored.response.input_stable_id == "a" * 32

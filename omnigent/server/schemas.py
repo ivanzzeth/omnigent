@@ -32,6 +32,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.native.input_receipt import NativeInputReceipt
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1234,6 +1235,8 @@ class ResponseObject(BaseModel):
     background: bool = False
     store: bool = True
     usage: Usage | None = None
+    native_input_receipt: NativeInputReceipt | None = None
+    input_stable_id: str | None = None
     previous_response_id: str | None = None
     conversation: ConversationRef | None = None
     instructions: str | None = None
@@ -3344,6 +3347,8 @@ class SessionStatusEvent(_SSEEventBase):
     conversation_id: str
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
+    native_terminal: bool = False
+    native_outcome: Literal["completed", "failed", "cancelled"] | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None

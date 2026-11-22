@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -59,6 +60,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.elicitation import (
     codex_elicitation_id,
+    codex_response_id,
 )
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
@@ -1228,6 +1230,7 @@ class _CodexTurnStatusEdge:
     error: _CodexTerminalError | None = None
     compaction_model: str | None = None
     selected_model: str | None = None
+    outcome: Literal["completed", "failed", "cancelled"] | None = None
 
 
 @dataclass(frozen=True)
@@ -3006,6 +3009,13 @@ def _resume_terminal_status_edge_for_latest_turn(
             turn_id=turn_id,
             source="thread/resume:turn-error" if error is not None else "thread/resume",
             error=error,
+            outcome=(
+                "failed"
+                if status == "failed"
+                else "cancelled"
+                if _turn_status_is_interrupted(_turn_status_from_params({"turn": turn}))
+                else "completed"
+            ),
         )
     return None
 
@@ -5181,6 +5191,13 @@ def _terminal_turn_status_edge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
         source=source,
+        outcome=(
+            "failed"
+            if method != "turn/completed"
+            else "cancelled"
+            if _turn_status_is_interrupted(_turn_status_from_params(params))
+            else "completed"
+        ),
     )
 
 
@@ -6993,6 +7010,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    turn_outcome: Literal["completed", "failed", "cancelled"] | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -7014,6 +7032,9 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
+        data["turn_completed"] = turn_outcome == "completed"
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -7094,6 +7115,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        turn_outcome="failed" if edge.status == "failed" else edge.outcome,
     )
 
 
@@ -8672,7 +8694,7 @@ def _response_id(params: _JsonObject) -> str:
     """
     turn_id = params.get("turnId")
     if isinstance(turn_id, str) and turn_id:
-        return f"codex_{turn_id}"
+        return codex_response_id(turn_id)
     return "codex_native"
 
 

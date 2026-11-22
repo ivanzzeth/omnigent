@@ -51,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_unmirrored_codex_settings,
     update_active_turn_id,
 )
+from omnigent.harnesses.codex_native.elicitation import codex_response_id
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
     goal_objective_length_error,
@@ -76,9 +77,11 @@ from omnigent.inner.native_attachments import (
     uses_filesystem_delivery,
 )
 from omnigent.native.input_diagnostics import (
+    current_input_attributes,
     log_input_event,
     with_input_attributes,
 )
+from omnigent.native.input_receipt import NativeInputReceipt
 from omnigent.process_logging import log_once
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
@@ -339,7 +342,7 @@ async def _start_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> str | None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
@@ -408,6 +411,8 @@ async def _start_codex_turn(
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
+        return codex_response_id(turn_id)
+    return None
 
 
 async def _steer_codex_turn(
@@ -416,7 +421,7 @@ async def _steer_codex_turn(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
-) -> None:
+) -> str | None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
     response = await _native_delivery_request(
@@ -435,6 +440,8 @@ async def _steer_codex_turn(
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        return codex_response_id(turn_id)
+    return None
 
 
 async def _inject_codex_turn(
@@ -444,23 +451,22 @@ async def _inject_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> str | None:
     """Retain explicitly refused input while an active compaction settles."""
     try:
-        await _inject_codex_turn_once(
+        return await _inject_codex_turn_once(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-        return
     except CodexAppServerResponseError as error:
         if state.active_turn_id is None or not is_compaction_steer_refusal(error):
             raise
     recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
     try:
-        await _inject_codex_turn_once(
+        return await _inject_codex_turn_once(
             client,
             bridge_dir=bridge_dir,
             state=recovered_state,
@@ -536,27 +542,25 @@ async def _inject_codex_turn_once(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+) -> str | None:
     """Steer an active turn or start one, recovering one proven stale steer."""
     if state.active_turn_id is None:
-        await _start_codex_turn(
+        return await _start_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
         )
-        return
 
     expected_turn_id = state.active_turn_id
     try:
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
         )
-        return
     except CodexAppServerResponseError as error:
         if not is_stale_active_turn_error(error):
             raise
@@ -573,15 +577,14 @@ async def _inject_codex_turn_once(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
             recovered_state.active_turn_id,
         )
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=recovered_state,
             input_items=input_items,
         )
-        return
     _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
-    await _start_codex_turn(
+    return await _start_codex_turn(
         client,
         bridge_dir=bridge_dir,
         state=recovered_state,
@@ -815,6 +818,7 @@ class CodexNativeExecutor(Executor):
                     max_wait_seconds,
                 )
 
+        terminal_response_id: str | None = None
         error_msg: str | None = None
         startup_failure: CodexStartupFailure | None = None
         undelivered = False
@@ -927,7 +931,7 @@ class CodexNativeExecutor(Executor):
                                         "objective": goal_objective,
                                     },
                                 )
-                            await _inject_codex_turn(
+                            terminal_response_id = await _inject_codex_turn(
                                 client,
                                 bridge_dir=self._bridge_dir,
                                 state=state,
@@ -992,7 +996,14 @@ class CodexNativeExecutor(Executor):
                 undelivered=undelivered,
             )
         else:
-            yield TurnComplete(response=None)
+            stable_id = current_input_attributes().get("input_stable_id")
+            receipt: NativeInputReceipt | None = None
+            if isinstance(stable_id, str) and terminal_response_id is not None:
+                receipt = {
+                    "input_stable_id": stable_id,
+                    "terminal_response_id": terminal_response_id,
+                }
+            yield TurnComplete(response=None, native_input_receipt=receipt)
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:

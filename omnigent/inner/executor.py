@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from omnigent.native.input_receipt import NativeInputReceipt
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,7 @@ class TurnComplete(ExecutorEvent):
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    native_input_receipt: NativeInputReceipt | None = None
 
 
 class ToolCallStatus(str, enum.Enum):

@@ -752,3 +752,34 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+async def test_native_terminal_status_preserves_original_outcome(
+    status_route: _StatusRoute, outcome: str
+) -> None:
+    """The original external lifecycle owner marks terminal; idle-only never does."""
+    route = status_route
+    sid = route.parent_id
+    response = await route.client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed" if outcome == "failed" else "idle",
+                "response_id": "opaque-current-turn",
+                "turn_outcome": outcome,
+                "turn_completed": outcome == "completed",
+                "output": "diagnostic",
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    events = [
+        call.args[1]
+        for call in route.published.call_args_list
+        if call.args[0] == sid and call.args[1].get("type") == "session.status"
+    ]
+    assert events[-1]["native_terminal"] is True
+    assert events[-1]["native_outcome"] == outcome
+    assert events[-1]["response_id"] == "opaque-current-turn"

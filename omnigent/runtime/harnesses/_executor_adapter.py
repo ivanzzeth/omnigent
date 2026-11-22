@@ -1133,6 +1133,7 @@ class ExecutorAdapter(HarnessApp):
                 item["arguments"] = raw_args
             ctx.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         elif isinstance(event, TurnComplete):
+            ctx.native_input_receipt = event.native_input_receipt
             if event.response is not None:
                 pass
             # Capture provider-reported usage for the response.completed payload.

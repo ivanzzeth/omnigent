@@ -2318,11 +2318,23 @@ def register_events_routes(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            native_outcome = None
+            if status in {"idle", "failed"} and isinstance(response_id, str) and response_id:
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                native_outcome = native_subagent_terminal_status(
+                    status,
+                    harness=harness,
+                    turn_outcome=data.get("turn_outcome"),
+                    turn_completed=data.get("turn_completed"),
+                )
             _publish_status(
                 session_id,
                 status,
                 status_error,
                 failure_origin="external_session_status",
+                native_outcome=native_outcome,
                 failure_context=data.get("failure_context"),
                 response_id=response_id,
                 background_task_count=bg_count,

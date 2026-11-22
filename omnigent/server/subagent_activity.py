@@ -40,12 +40,18 @@ def native_subagent_terminal_status(
     harness: str | None,
     turn_outcome: object = None,
     turn_completed: object = None,
-) -> str | None:
+) -> Literal["completed", "failed", "cancelled"] | None:
     """A Claude or unresolved-harness idle needs an explicit completion signal."""
     if status not in {"idle", "failed"}:
         return None
-    if isinstance(turn_outcome, str) and turn_outcome in {"completed", "failed", "cancelled"}:
-        return turn_outcome
+    if isinstance(turn_outcome, str):
+        match turn_outcome:
+            case "completed":
+                return "completed"
+            case "failed":
+                return "failed"
+            case "cancelled":
+                return "cancelled"
     if status == "failed":
         return "failed"
     if harness in {None, "auto", "any", "claude-native"} and turn_completed is not True:

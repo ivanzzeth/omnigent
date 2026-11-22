@@ -53,6 +53,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.native.input_receipt import NativeInputReceipt
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -495,6 +496,8 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        self.native_input_receipt: NativeInputReceipt | None = None
+        self.input_stable_id: str | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -1453,6 +1456,7 @@ class HarnessApp:
         :yields: SSE-formatted ``bytes`` ready to ship over the
             HTTP response.
         """
+        ctx.input_stable_id = request.input_stable_id
         sequence = 0
         for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
             yield _format_sse_event(initial_event)
@@ -1541,6 +1545,7 @@ class HarnessApp:
             status="queued",
             model=model,
             created_at=int(time.time()),
+            input_stable_id=ctx.input_stable_id,
         )
         in_progress_response = initial_response.model_copy(update={"status": "in_progress"})
         return [
@@ -1962,6 +1967,8 @@ class HarnessApp:
             created_at=int(time.time()),
             error=None if exception is None else self._build_error_detail(exception),
             usage=usage,
+            native_input_receipt=ctx.native_input_receipt,
+            input_stable_id=ctx.input_stable_id,
         )
         terminal: ServerStreamEvent
         if status_value == "completed":

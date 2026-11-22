@@ -13323,3 +13323,17 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [("completed", "completed"), ("interrupted", "cancelled"), ("failed", "failed")],
+)
+def test_original_native_boundary_carries_explicit_outcome(status: str, outcome: str) -> None:
+    """Existing turn classification supplies a generic, opaque terminal identity."""
+    edge = codex_native_forwarder._terminal_turn_status_edge(
+        None, "turn/completed", {"turn": {"id": "turn_current", "status": status, "items": []}}
+    )
+    assert edge is not None
+    assert edge.turn_id == "turn_current"
+    assert ("failed" if edge.status == "failed" else edge.outcome) == outcome

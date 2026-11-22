@@ -4968,6 +4968,7 @@ def _publish_status(
     failure_origin: str | None = None,
     failure_context: object = None,
     disconnect_evidence: Mapping[str, str] | None = None,
+    native_outcome: Literal["completed", "failed", "cancelled"] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5128,12 +5129,17 @@ def _publish_status(
         conversation_id=session_id,
         status=status,  # type: ignore[arg-type]
         response_id=response_id,
+        native_terminal=native_outcome is not None,
+        native_outcome=native_outcome,
         error=error,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         blocked_on=blocked_on,
     )
     payload = event.model_dump()
+    if native_outcome is None:
+        payload.pop("native_terminal", None)
+        payload.pop("native_outcome", None)
     if response_id is None:
         payload.pop("response_id", None)
     if background_task_count is None:

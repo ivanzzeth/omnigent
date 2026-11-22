@@ -3554,3 +3554,25 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+async def test_native_input_receipt_uses_real_ack_identity(
+    draining_client, tmp_path: Path
+) -> None:
+    """The original client ACK binds input identity; no native stream is consumed."""
+    _seed_bridge(tmp_path, active_turn_id=None)
+    draining_client.delivery_errors = []
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="delivery_response"):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "diagnostic"}], [], ""
+            )
+        ]
+    assert len(events) == 1 and isinstance(events[0], TurnComplete)
+    assert events[0].native_input_receipt == {
+        "input_stable_id": "a" * 32,
+        "terminal_response_id": "codex_turn_1",
+    }
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "diagnostic"}]]

@@ -51,3 +51,8 @@ def codex_elicitation_id(
     ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:_CODEX_ELICITATION_ID_DIGEST_LENGTH]
     return f"elicit_codex_{digest}"
+
+
+def codex_response_id(turn_id: str) -> str:
+    """Return the original opaque response identity for a Codex turn."""
+    return f"codex_{turn_id}"
