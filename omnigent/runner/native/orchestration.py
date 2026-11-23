@@ -4896,6 +4896,7 @@ async def _launch_codex_native_tui(
             "check_for_update_on_startup=false",
         ),
         codex_cli_version=app_server.codex_cli_version,
+        **({"deployment_policy": deployment_policy} if deployment_policy is not None else {}),
         # The runner provisions and trusts these hooks. An unknown CLI version
         # must not strand a headless session behind an interactive trust prompt.
         bypass_hook_trust=(
@@ -5830,6 +5831,11 @@ async def _auto_create_codex_terminal(
                         codex_ws_url,
                         launch_config.external_session_id,
                         terminal_launch_args=launch_config.terminal_launch_args,
+                        **(
+                            {"deployment_policy": deployment_policy}
+                            if deployment_policy is not None
+                            else {}
+                        ),
                         cwd=Path(workspace),
                         model_provider=(
                             _session_meta_provider

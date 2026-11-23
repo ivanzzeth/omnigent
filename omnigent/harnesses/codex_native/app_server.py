@@ -3747,6 +3747,25 @@ def _resolve_databricks_codex_model(
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 
+_CODEX_DEPLOYMENT_PERMISSION_OVERRIDES = (
+    'approval_policy="on-request"',
+    'sandbox_mode="workspace-write"',
+    'approvals_reviewer="user"',
+    "features.request_permissions_tool=true",
+)
+
+
+def _codex_deployment_permission_args(
+    args: Sequence[str] | None, deployment_policy: NativeDeploymentPolicy | None
+) -> list[str]:
+    """Apply provider-owned permission settings only to restricted deployments."""
+    result = list(args or ())
+    if deployment_policy is not None:
+        for override in _CODEX_DEPLOYMENT_PERMISSION_OVERRIDES:
+            result.extend(["-c", override])
+    return result
+
+
 def validate_codex_deployment_args(args: Sequence[str]) -> None:
     """Reject overrides outside this provider's restricted launch contract."""
     canonical = canonical_codex_launch_args(args)
@@ -3899,7 +3918,7 @@ def build_codex_native_server(
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
     if deployment_policy is not None:
-        config_overrides.extend(['approval_policy="on-request"', 'sandbox_mode="workspace-write"'])
+        config_overrides.extend(_CODEX_DEPLOYMENT_PERMISSION_OVERRIDES)
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -4939,6 +4958,7 @@ async def preload_codex_thread_for_resume(
     retain_client: bool = False,
     cwd: Path | None = None,
     model_provider: str | None = None,
+    deployment_policy: NativeDeploymentPolicy | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4969,7 +4989,12 @@ async def preload_codex_thread_for_resume(
     retained = False
     try:
         await client.connect()
-        params = _codex_resume_permission_params(terminal_launch_args)
+        params = _codex_resume_permission_params(
+            _codex_deployment_permission_args(terminal_launch_args, deployment_policy)
+        )
+        if deployment_policy is not None:
+            config = cast(CodexParams, params.setdefault("config", {}))
+            _set_codex_resume_config_value(config, "features.request_permissions_tool", True)
         # Resume otherwise restores the persisted provider even when startup
         # config and the refreshed rollout name a different one.
         if model_provider is not None:
@@ -5245,6 +5270,7 @@ def build_codex_remote_args(
     codex_cli_version: tuple[int, int, int] | None = None,
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
+    deployment_policy: NativeDeploymentPolicy | None = None,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -5316,6 +5342,7 @@ def build_codex_remote_args(
     # below; reject caller pass-through args that would re-select or re-attach
     # that transport (e.g. ``codex app-server … --remote``, which clap rejects).
     reject_reserved_codex_transport_args(codex_args)
+    codex_args = tuple(_codex_deployment_permission_args(codex_args, deployment_policy))
     if thread_id is not None:
         # Codex submits a positional ahead of ``resume`` as a new prompt to the
         # resumed thread; the persisted launch prompt was meant for the first start.
