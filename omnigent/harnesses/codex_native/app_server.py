@@ -41,6 +41,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
 from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
+    codex_managed_mcp_env,
     mirror_applied_codex_settings,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -312,11 +313,16 @@ def _codex_mcp_server_config_section(
         for tool in framework_approved_tools(routed_spawns=routed_spawns)
     )
     required_config = "required = true\n" if required else ""
+    managed_env = (
+        f"env = {{ HOME = {json.dumps(codex_managed_mcp_env(bridge_dir)['HOME'])} }}\n"
+        if required
+        else ""
+    )
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
         f"args = [{args_toml}]\n"
-        f"{required_config}\n"
+        f"{required_config}{managed_env}\n"
         f"{approvals}"
     )
 

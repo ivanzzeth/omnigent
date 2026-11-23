@@ -385,6 +385,36 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
             os.unlink(tmp_name)
 
 
+def codex_managed_mcp_env(bridge_dir: Path) -> dict[str, str]:
+    """Keep the token-only relay under its original trusted HOME anchor.
+
+    Restricted Codex has a separate HOME. Only the framework's own relay
+    subprocess receives this anchor; native and user MCP environments do not.
+    """
+    root = bridge_root()
+    if (
+        not root.is_absolute()
+        or root.name != "codex-native"
+        or root.parent.name != ".omnigent"
+        or root.resolve(strict=True) != root
+        or bridge_dir.parent != root
+        or bridge_dir.resolve(strict=True) != bridge_dir
+    ):
+        raise ValueError("managed Codex MCP requires its canonical standard bridge root")
+    config_path = bridge_dir / _MCP_CONFIG_FILE
+    if config_path.is_symlink():
+        raise ValueError("managed Codex MCP config must not be a symlink")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"token"}
+        or not isinstance(config["token"], str)
+        or not config["token"]
+    ):
+        raise ValueError("managed Codex MCP requires its token-only relay config")
+    return {"HOME": str(root.parent.parent)}
+
+
 def codex_mcp_config_overrides(
     bridge_dir: Path,
     *,
@@ -426,6 +456,13 @@ def codex_mcp_config_overrides(
         f'mcp_servers.omnigent.command="{python}"',
         f"mcp_servers.omnigent.args={args_toml}",
         *(["mcp_servers.omnigent.required=true"] if required else []),
+        *(
+            [
+                f"mcp_servers.omnigent.env.HOME={json.dumps(codex_managed_mcp_env(bridge_dir)['HOME'])}"
+            ]
+            if required
+            else []
+        ),
     ]
 
 

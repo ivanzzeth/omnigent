@@ -77,7 +77,7 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
 
 @pytest.mark.parametrize("required", [False, True])
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(
-    tmp_path: Path, required: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, required: bool
 ) -> None:
     """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
 
@@ -87,7 +87,11 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
-    overrides = codex_mcp_config_overrides(tmp_path, required=required)
+    directory = tmp_path / ".omnigent/codex-native/instance"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", directory.parent)
+    codex_native_bridge.write_mcp_bridge_config(directory)
+    overrides = codex_mcp_config_overrides(directory, required=required)
     assert ("mcp_servers.omnigent.required=true" in overrides) is required
 
     prefix = "mcp_servers.omnigent.args="

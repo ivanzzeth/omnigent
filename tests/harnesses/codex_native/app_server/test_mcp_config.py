@@ -36,7 +36,13 @@ async def test_start_requires_managed_mcp_only_for_deployment(
     source.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(source))
     _set_codex_version(monkeypatch, (0, 166, 0))
-    server = _test_app_server(tmp_path, tmp_path / "private", tmp_path / "bridge", tmp_path)
+    from omnigent.harnesses.codex_native import bridge
+
+    directory = tmp_path / ".omnigent/codex-native/instance"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", directory.parent)
+    bridge.write_mcp_bridge_config(directory)
+    server = _test_app_server(tmp_path, tmp_path / "private", directory, tmp_path)
     server.deployment_policy = NativeDeploymentPolicy() if restricted else None
     server.deployment_spec_sha256 = "a" * 64 if restricted else None
     server.ap_server_url = "http://127.0.0.1:1"
@@ -46,6 +52,7 @@ async def test_start_requires_managed_mcp_only_for_deployment(
         config = tomllib.loads((server.codex_home / "config.toml").read_text())
         managed = config["mcp_servers"]["omnigent"]
         assert managed.get("required") is (True if restricted else None)
+        assert managed.get("env") == ({"HOME": str(tmp_path)} if restricted else None)
         assert managed["command"] == "/new/python"
         assert "serve-mcp" in managed["args"]
         raise RuntimeError("inspected-before-process-launch")
