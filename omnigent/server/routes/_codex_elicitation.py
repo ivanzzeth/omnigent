@@ -656,6 +656,8 @@ def _codex_command_approval_params(
         "codex_method": method,
         "codex_request_id": request_id,
     }
+    if "availableDecisions" in params:
+        extras["availableDecisions"] = params["availableDecisions"]
     if isinstance(command, str) and command:
         extras["command"] = command
     if isinstance(cwd, str) and cwd:

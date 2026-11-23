@@ -74,6 +74,56 @@ class TestParseCodexElicitationRequest:
         )
         assert req.method == "item/commandExecution/requestApproval"
 
+    @pytest.mark.parametrize(
+        "method", ["item/commandExecution/requestApproval", "execCommandApproval"]
+    )
+    def test_command_approval_does_not_invent_available_decisions(self, method: str) -> None:
+        request = parse_codex_elicitation_request(
+            {"id": 2, "method": method, "params": {"command": "git status"}}
+        )
+
+        assert "availableDecisions" not in request.params.model_dump(mode="json")
+
+    @pytest.mark.parametrize(
+        "method", ["item/commandExecution/requestApproval", "execCommandApproval"]
+    )
+    @pytest.mark.parametrize(
+        "available_decisions",
+        [
+            [],
+            ["accept", "decline", "cancel"],
+            [
+                "accept",
+                {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["git", "commit"]}},
+                "acceptForSession",
+                {
+                    "acceptWithNetworkPolicyAmendment": {
+                        "network_policy_amendment": {"host": "example.invalid", "action": "allow"}
+                    }
+                },
+                {"futureDecision": {"opaque": [True, None, 7]}},
+            ],
+        ],
+    )
+    def test_command_approval_preserves_original_available_decisions(
+        self, method: str, available_decisions: list[object]
+    ) -> None:
+        request = parse_codex_elicitation_request(
+            {
+                "id": 2,
+                "method": method,
+                "params": {"command": "git status", "availableDecisions": available_decisions},
+            }
+        )
+
+        assert request.params.model_dump(mode="json")["availableDecisions"] == available_decisions
+        # Advertising an original option does not add a new response action.
+        assert request.build_response(ElicitationResult(action="accept")) == {
+            "decision": "accept"
+            if method == "item/commandExecution/requestApproval"
+            else "approved"
+        }
+
 
 # ── Codex MCP approval persistence ───────────────────────────────────
 
