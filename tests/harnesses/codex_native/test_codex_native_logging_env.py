@@ -21,6 +21,17 @@ def test_default_filter_supports_both_http_clients_without_legacy_payload_tracin
     directives = CODEX_DIAGNOSTIC_RUST_LOG.split(",")
     assert "codex_http_client=debug" in directives
     assert "codex_client::default_client=debug" in directives
+    assert directives.count("codex_mcp=info") == 1
+    assert [value for value in directives if value != "codex_mcp=info"] == [
+        "warn",
+        "codex_core::client=info",
+        "codex_core::tools::parallel=debug",
+        "codex_core::mcp=info",
+        "codex_http_client=debug",
+        "codex_client::default_client=debug",
+        "codex_mcp_client=info",
+        "codex_code_mode::timing=debug",
+    ]
     assert not any(
         directive.partition("=")[0] in {"codex_api", "codex_client", "codex_client::transport"}
         for directive in directives

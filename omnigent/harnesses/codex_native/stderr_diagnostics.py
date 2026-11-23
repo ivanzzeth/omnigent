@@ -20,7 +20,7 @@ from omnigent.process_logging import harness_stderr_capture_enabled
 CODEX_DIAGNOSTIC_RUST_LOG = (
     "warn,codex_core::client=info,codex_core::tools::parallel=debug,"
     "codex_core::mcp=info,codex_http_client=debug,codex_client::default_client=debug,"
-    "codex_mcp_client=info,codex_code_mode::timing=debug"
+    "codex_mcp_client=info,codex_mcp=info,codex_code_mode::timing=debug"
 )
 MAX_STDERR_RECORD_BYTES = 1024 * 1024  # Includes the newline when present.
 _QUEUE_BYTES = MAX_STDERR_RECORD_BYTES
