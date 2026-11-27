@@ -335,7 +335,10 @@ class HostStore:
                             SqlHost.token_hash == hash_host_launch_token(managed_token),
                             SqlHost.token_expires_at.is_not(None),
                             SqlHost.token_expires_at >= now,
-                            SqlHost.sandbox_id.is_not(None),
+                            or_(
+                                SqlHost.sandbox_provider.is_(None),
+                                SqlHost.sandbox_id.is_not(None),
+                            ),
                             SqlHost.deleted_at.is_(None),
                         )
                         .values(
@@ -1034,15 +1037,15 @@ class HostStore:
         name: str,
         user_id: str,
         token: str,
-        provider: str,
-        sandbox_id: str,
+        provider: str | None,
+        sandbox_id: str | None,
         token_expires_at: int,
     ) -> Host:
         """
-        Create a server-managed sandbox host with its credential.
+        Create a credentialled host, optionally backed by a managed sandbox.
 
-        Called by the managed-launch orchestration after the sandbox is
-        provisioned and BEFORE the in-sandbox host process starts, so
+        Called before the host process starts (after provisioning when using
+        a sandbox), so
         the launch token is resolvable by the time the host first dials
         the tunnel. The row is created ``"offline"``; the tunnel's
         normal ``upsert_on_connect`` flips it online when the host
@@ -1057,13 +1060,16 @@ class HostStore:
             ``"alice@example.com"``.
         :param token: The RAW launch token (hashed here, never stored),
             e.g. the value of ``secrets.token_urlsafe(32)``.
-        :param provider: Sandbox provider name, e.g. ``"modal"``.
-        :param sandbox_id: Provider-assigned sandbox id, e.g.
-            ``"sb-a1b2c3"``.
+        :param provider: Sandbox provider name, e.g. ``"modal"``; ``None``
+            together with ``sandbox_id=None`` for an external machine.
+        :param sandbox_id: Provider-assigned sandbox id, e.g. ``"sb-a1b2c3"``;
+            ``None`` for an external machine. No sandbox resource is created.
         :param token_expires_at: Unix epoch seconds after which the
             token no longer authenticates.
         :returns: The registered :class:`Host`.
         """
+        if (provider is None) != (sandbox_id is None):
+            raise ValueError("sandbox provider and id must both be set or both be absent")
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
 
