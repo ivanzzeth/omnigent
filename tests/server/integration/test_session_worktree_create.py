@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +34,7 @@ from omnigent.host.frames import (
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
 from omnigent.stores.host_store import HostStore
+from tests._helpers.session import bundle_files
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -69,6 +71,125 @@ class _HostCapture:
 # Factory yielded by the ``register_worktree_host`` fixture:
 # register(*, create_status=, create_error=) -> _HostCapture.
 RegisterHost = Callable[..., _HostCapture]
+
+
+def _worktree_bundle() -> bytes:
+    return bundle_files(
+        {
+            "config.yaml": json.dumps(
+                {
+                    "spec_version": 1,
+                    "name": "worktree-bundle",
+                    "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+                    "prompt": "Worktree fixture",
+                }
+            ).encode()
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", ["create", "existing_branch", "existing_worktree"])
+async def test_bundle_worktree_and_reused_upload(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    mode: str,
+) -> None:
+    cap = register_worktree_host()
+    git = {"branch_name": "feature/bundle"}
+    if mode != "create":
+        git[mode] = True
+    bundle = _worktree_bundle()
+    agent_ids = []
+    for _ in range(2):
+        response = await client.post(
+            "/v1/sessions",
+            data={
+                "metadata": json.dumps(
+                    {
+                        "host_id": _HOST_ID,
+                        "workspace": _SOURCE_REPO,
+                        "git": git,
+                    }
+                )
+            },
+            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        )
+        assert response.status_code == 201, response.text
+        agent_ids.append(response.json()["agent_id"])
+        snapshot = (await client.get("/v1/sessions/" + response.json()["session_id"])).json()
+        assert snapshot["git_branch"] == "feature/bundle"
+        assert snapshot["workspace"] == (
+            _SOURCE_REPO
+            if mode == "existing_worktree"
+            else _SOURCE_REPO + "-worktrees/feature-bundle"
+        )
+    assert agent_ids[0] == agent_ids[1]
+    assert len(cap.create) == (0 if mode == "existing_worktree" else 2)
+
+
+@pytest.mark.parametrize("mode", ["create", "existing_branch", "existing_worktree"])
+async def test_bundle_worktree_persistence_failure(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    from omnigent.server.routes.sessions import routes_core
+
+    cap = register_worktree_host()
+    git = {"branch_name": "feature/bundle-failure"}
+    if mode != "create":
+        git[mode] = True
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("bundle persistence failed")
+
+    monkeypatch.setattr(routes_core, "_create_session_from_bundle", fail)
+    with pytest.raises(RuntimeError, match="bundle persistence failed"):
+        await client.post(
+            "/v1/sessions",
+            data={
+                "metadata": json.dumps(
+                    {
+                        "host_id": _HOST_ID,
+                        "workspace": _SOURCE_REPO,
+                        "git": git,
+                    }
+                )
+            },
+            files={"bundle": ("agent.tar.gz", _worktree_bundle(), "application/gzip")},
+        )
+    assert len(cap.remove) == (0 if mode == "existing_worktree" else 1)
+    if cap.remove:
+        assert cap.remove[0].delete_branch == (mode == "create")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"host_id": None}, {"parent_session_id": "another"}, {"git": {"branch_name": "../invalid"}}],
+)
+async def test_bundle_git_rejects_invalid_metadata_before_host(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    overrides: dict[str, Any],
+) -> None:
+    cap = register_worktree_host()
+    response = await client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {
+                    "host_id": _HOST_ID,
+                    "workspace": _SOURCE_REPO,
+                    "git": {"branch_name": "valid"},
+                    **overrides,
+                }
+            )
+        },
+        files={"bundle": ("agent.tar.gz", _worktree_bundle(), "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert not cap.create and not cap.launches
 
 
 @pytest_asyncio.fixture()

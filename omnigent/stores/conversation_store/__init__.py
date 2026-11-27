@@ -1854,6 +1854,7 @@ class ConversationStore(ABC):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
