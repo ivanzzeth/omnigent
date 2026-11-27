@@ -1223,7 +1223,10 @@ def test_replace_managed_host_sandbox_rotates_credential(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-gen2"
 
 
-def test_managed_columns_survive_connect(db_uri: str) -> None:
+@pytest.mark.parametrize("provider,sandbox_id", [("modal", "sb-m4"), (None, None)])
+def test_managed_columns_survive_connect(
+    db_uri: str, provider: str | None, sandbox_id: str | None
+) -> None:
     """
     The tunnel's ``upsert_on_connect`` (which fires when the sandbox
     host registers) must flip the pre-registered row online WITHOUT
@@ -1236,8 +1239,8 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
         name="managed-m4",
         user_id="alice@example.com",
         token="raw-launch-token-4",
-        provider="modal",
-        sandbox_id="sb-m4",
+        provider=provider,
+        sandbox_id=sandbox_id,
         token_expires_at=now_epoch() + 3600,
     )
 
@@ -1249,13 +1252,66 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
     )
 
     assert connected.status == "online"
-    assert connected.sandbox_provider == "modal"
-    assert connected.sandbox_id == "sb-m4"
+    assert connected.sandbox_provider == provider
+    assert connected.sandbox_id == sandbox_id
     # The credential still resolves after connect.
     assert (
         store.resolve_launch_token("d55a61010459cea88ed2af0fe916139b", "raw-launch-token-4")
         is not None
     )
+
+
+@pytest.mark.parametrize(
+    "denial", ["token", "host", "user", "workspace", "expired", "revoked", "deleted"]
+)
+def test_external_host_credential_refusals(db_uri: str, denial: str) -> None:
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    token = "external-host-token"
+    store.register_managed_host(
+        host_id=host_id,
+        name="external",
+        user_id="alice@example.com",
+        token=token,
+        provider=None,
+        sandbox_id=None,
+        token_expires_at=now_epoch() + (-1 if denial == "expired" else 3600),
+    )
+    if denial == "revoked":
+        store.revoke_launch_token(host_id)
+    elif denial == "deleted":
+        store.delete_host(host_id)
+    with workspace_scope(
+        current_workspace_id() + 1 if denial == "workspace" else current_workspace_id()
+    ):
+        with pytest.raises(ValueError, match="no longer valid"):
+            store.upsert_on_connect(
+                host_id=uuid.uuid4().hex if denial == "host" else host_id,
+                name="external",
+                user_id="bob@example.com" if denial == "user" else "alice@example.com",
+                managed_token="wrong" if denial == "token" else token,
+            )
+    row = store.get_host(host_id)
+    assert row is None if denial == "deleted" else row is not None and row.status == "offline"
+
+
+@pytest.mark.parametrize("provider,sandbox_id", [("modal", None), (None, "sb-partial")])
+def test_credentialled_host_rejects_partial_sandbox(
+    db_uri: str, provider: str | None, sandbox_id: str | None
+) -> None:
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    with pytest.raises(ValueError, match="both be set or both be absent"):
+        store.register_managed_host(
+            host_id=host_id,
+            name="partial",
+            user_id="alice@example.com",
+            token="secret",
+            provider=provider,
+            sandbox_id=sandbox_id,
+            token_expires_at=now_epoch() + 3600,
+        )
+    assert store.get_host(host_id) is None
 
 
 def test_delete_host_hides_row_and_retains_cleanup_tombstone(db_uri: str) -> None:
