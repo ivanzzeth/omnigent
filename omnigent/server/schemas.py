@@ -1914,6 +1914,7 @@ class SessionCreateMetadata(BaseModel):
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
+    git: SessionGitOptions | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1921,6 +1922,12 @@ class SessionCreateMetadata(BaseModel):
 
     @model_validator(mode="after")
     def _check_startup_input(self) -> Self:
+        if self.git is not None and (
+            (self.host_id is None and self.project_id is None)
+            or self.host_type != "external"
+            or self.parent_session_id is not None
+        ):
+            raise ValueError("bundled git requires an external host and a top-level session")
         if self.initial_input is not None and self.host_type != "managed":
             raise ValueError("initial_input requires host_type=managed")
         return self

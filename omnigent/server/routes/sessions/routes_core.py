@@ -1374,20 +1374,23 @@ def register_core_routes(
             host_store=getattr(request.app.state, "host_store", None),
             parent=parent_conv,
         )
-        with creation_stage("create_persistence_ms"):
-            result = await asyncio.to_thread(
-                _create_session_from_bundle,
-                conversation_store,
-                artifact_store,
-                parsed_metadata,
-                bundle_bytes,
-                inherited_runner_id,
-                spec,
-                inference_snapshot,
-                inference_model,
-                created_by=user_id,
-                agent_store=agent_store,
-            )
+        from omnigent.server.routes._sessions.helpers import _bundled_session_worktree
+
+        async with _bundled_session_worktree(request, parsed_metadata) as parsed_metadata:
+            with creation_stage("create_persistence_ms"):
+                result = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    parsed_metadata,
+                    bundle_bytes,
+                    inherited_runner_id,
+                    spec,
+                    inference_snapshot,
+                    inference_model,
+                    created_by=user_id,
+                    agent_store=agent_store,
+                )
         session_created(
             result.session_id,
             inherited_runner_id,

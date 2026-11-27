@@ -10713,6 +10713,54 @@ def _require_cost_control_label_authority(
     )
 
 
+@contextlib.asynccontextmanager
+async def _bundled_session_worktree(
+    request: Request, metadata: SessionCreateMetadata
+) -> AsyncIterator[SessionCreateMetadata]:
+    """Use the original Host worktree path around bundled session persistence."""
+    git = metadata.git
+    if git is None:
+        yield metadata
+        return
+    from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    try:
+        validate_branch_name(git.branch_name)
+    except WorktreeError as exc:
+        raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+    created = None
+    if not git.existing_worktree:
+        created = await _create_session_worktree(
+            host_id=metadata.host_id, source_repo=metadata.workspace, git=git, request=request
+        )
+        metadata = metadata.model_copy(
+            update={
+                "workspace": created.workspace or created.worktree_path,
+                "labels": {
+                    **metadata.labels,
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(created.worktree_path),
+                },
+            }
+        )
+    try:
+        yield metadata
+    except BaseException:
+        if created is not None and metadata.host_id is not None:
+            await _remove_session_worktree_best_effort(
+                host_id=metadata.host_id,
+                worktree_path=created.worktree_path,
+                branch=created.branch,
+                delete_branch=not git.existing_branch,
+                host_registry=request.app.state.host_registry,
+                reason="create-rollback",
+            )
+        raise
+
+
 def _persist_stored_session_bundle(
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
@@ -10766,6 +10814,7 @@ def _persist_stored_session_bundle(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
+            git_branch=metadata.git.branch_name if metadata.git else None,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -10846,6 +10895,7 @@ def _persist_session_for_uploaded_agent(
             runner_id=runner_id,
             host_id=metadata.host_id,
             workspace=metadata.workspace,
+            git_branch=metadata.git.branch_name if metadata.git else None,
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
