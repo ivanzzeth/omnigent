@@ -162,6 +162,7 @@ def test_github_info_equals_pr_info_and_keeps_the_legacy_fields(
 
     info = github_resource.github_info(str(repo))
 
+    assert info["workspace_head"] == _git_value(repo, "rev-parse", "HEAD")
     assert info == pr_resource.pr_info(str(repo))
     assert info["provider"] == "github"
     assert info["capabilities"] == GITHUB_CAPABILITIES
@@ -173,6 +174,20 @@ def test_github_info_equals_pr_info_and_keeps_the_legacy_fields(
         "accounts": info["accounts"],
         "selected_account": "alice",
     }
+
+
+def test_workspace_head_reads_current_checkout_and_reports_unavailable(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        pr_resource, "_workspace_info", lambda *_args, **_kwargs: {"pr": {"head_sha": "remote"}}
+    )
+    before = github_resource.github_info(str(repo))["workspace_head"]
+    _git(repo, "commit", "--allow-empty", "-m", "new checkout")
+    after = github_resource.github_info(str(repo))["workspace_head"]
+    assert after == _git_value(repo, "rev-parse", "HEAD")
+    assert before != after
+    assert github_resource.github_info(str(tmp_path))["workspace_head"] is None
 
 
 def test_tracked_github_pr_info_carries_the_provider_fields(

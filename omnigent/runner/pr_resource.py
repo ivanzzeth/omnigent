@@ -444,12 +444,16 @@ def pr_info(
     :param pr_url: The selected PR, which must be tracked by the session.
     :returns: A ``session.github.info`` payload.
     """
+    # A remote PR head does not identify the checkout the host is using.
+    code, head = _git_output(["rev-parse", "--verify", "HEAD^{commit}"], cwd=root)
+    workspace_head = head.strip() if code == 0 else None
     if session_id is None:
         info = _workspace_info(root)
         provider_id = info.get("provider")
         info["provider_display"] = (
             provider_display(provider_id) if isinstance(provider_id, str) else None
         )
+        info["workspace_head"] = workspace_head
         return info
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
@@ -507,6 +511,7 @@ def pr_info(
     info["provider_display"] = (
         provider_display(provider_id) if isinstance(provider_id, str) else None
     )
+    info["workspace_head"] = workspace_head
     return info
 
 
